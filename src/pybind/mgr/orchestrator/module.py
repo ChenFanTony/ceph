@@ -8,6 +8,12 @@ import datetime
 import yaml
 from prettytable import PrettyTable
 
+try:
+    from natsort import natsorted
+except ImportError:
+    # fallback to normal sort
+    natsorted = sorted  # type: ignore
+
 from ceph.deployment.inventory import Device
 from ceph.deployment.drive_group import DriveGroupSpec, DeviceSelection, OSDMethod
 from ceph.deployment.service_spec import PlacementSpec, ServiceSpec, service_spec_allow_invalid_from_json
@@ -57,6 +63,8 @@ class ServiceType(enum.Enum):
     grafana = 'grafana'
     node_exporter = 'node-exporter'
     prometheus = 'prometheus'
+    loki = 'loki'
+    promtail = 'promtail'
     mds = 'mds'
     rgw = 'rgw'
     nfs = 'nfs'
@@ -360,9 +368,9 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         return HandleCommandResult(stdout=completion.result_str())
 
     @_cli_write_command('orch host drain')
-    def _drain_host(self, hostname: str) -> HandleCommandResult:
+    def _drain_host(self, hostname: str, force: bool = False) -> HandleCommandResult:
         """drain all daemons from a host"""
-        completion = self.drain_host(hostname)
+        completion = self.drain_host(hostname, force)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
@@ -398,7 +406,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
             table.align = 'l'
             table.left_padding_width = 0
             table.right_padding_width = 2
-            for host in sorted(hosts, key=lambda h: h.hostname):
+            for host in natsorted(hosts, key=lambda h: h.hostname):
                 table.add_row((host.hostname, host.addr, ' '.join(
                     host.labels), host.status.capitalize()))
             output = table.get_string()
@@ -420,9 +428,9 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         return HandleCommandResult(stdout=completion.result_str())
 
     @_cli_write_command('orch host label rm')
-    def _host_label_rm(self, hostname: str, label: str) -> HandleCommandResult:
+    def _host_label_rm(self, hostname: str, label: str, force: bool = False) -> HandleCommandResult:
         """Remove a host label"""
-        completion = self.remove_host_label(hostname, label)
+        completion = self.remove_host_label(hostname, label, force)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
@@ -433,8 +441,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
-    @_cli_write_command(
-        'orch host maintenance enter')
+    @_cli_write_command('orch host maintenance enter')
     def _host_maintenance_enter(self, hostname: str, force: bool = False) -> HandleCommandResult:
         """
         Prepare a host for maintenance by shutting down and disabling all Ceph daemons (cephadm only)
@@ -444,8 +451,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
 
         return HandleCommandResult(stdout=completion.result_str())
 
-    @_cli_write_command(
-        'orch host maintenance exit')
+    @_cli_write_command('orch host maintenance exit')
     def _host_maintenance_exit(self, hostname: str) -> HandleCommandResult:
         """
         Return a host from maintenance, restarting all Ceph daemons (cephadm only)
@@ -507,7 +513,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
             table.left_padding_width = 0
             table.right_padding_width = 2
             now = datetime_now()
-            for host_ in sorted(inv_hosts, key=lambda h: h.name):  # type: InventoryHost
+            for host_ in natsorted(inv_hosts, key=lambda h: h.name):  # type: InventoryHost
                 for d in sorted(host_.devices.devices, key=lambda d: d.path):  # type: Device
 
                     led_ident = 'N/A'
@@ -685,7 +691,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
             table._align['MEM LIM'] = 'r'
             table.left_padding_width = 0
             table.right_padding_width = 2
-            for s in sorted(daemons, key=lambda s: s.name()):
+            for s in natsorted(daemons, key=lambda d: d.name()):
                 if s.status_desc:
                     status = s.status_desc
                 else:
@@ -786,20 +792,45 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         usage = """
 Usage:
   ceph orch daemon add osd host:device1,device2,...
+  ceph orch daemon add osd host:data_devices=device1,device2,db_devices=device3,osds_per_device=2,...
 """
         if not svc_arg:
             return HandleCommandResult(-errno.EINVAL, stderr=usage)
         try:
-            host_name, block_device = svc_arg.split(":")
-            block_devices = block_device.split(',')
-            devs = DeviceSelection(paths=block_devices)
+            host_name, raw = svc_arg.split(":")
+            drive_group_spec = {
+                'data_devices': []
+            }  # type: Dict
+            drv_grp_spec_arg = None
+            values = raw.split(',')
+            while values:
+                v = values[0].split(',', 1)[0]
+                if '=' in v:
+                    drv_grp_spec_arg, value = v.split('=')
+                    if drv_grp_spec_arg in ['data_devices',
+                                            'db_devices',
+                                            'wal_devices',
+                                            'journal_devices']:
+                        drive_group_spec[drv_grp_spec_arg] = []
+                        drive_group_spec[drv_grp_spec_arg].append(value)
+                    else:
+                        drive_group_spec[drv_grp_spec_arg] = value
+                elif drv_grp_spec_arg is not None:
+                    drive_group_spec[drv_grp_spec_arg].append(v)
+                else:
+                    drive_group_spec['data_devices'].append(v)
+                values.remove(v)
+
+            for dev_type in ['data_devices', 'db_devices', 'wal_devices', 'journal_devices']:
+                drive_group_spec[dev_type] = DeviceSelection(paths=drive_group_spec[dev_type]) if drive_group_spec.get(dev_type) else None
+
             drive_group = DriveGroupSpec(
                 placement=PlacementSpec(host_pattern=host_name),
-                data_devices=devs,
                 method=method,
+                **drive_group_spec,
             )
         except (TypeError, KeyError, ValueError) as e:
-            msg = f"Invalid host:device spec: '{svc_arg}': {e}" + usage
+            msg = f"Invalid 'host:device' spec: '{svc_arg}': {e}" + usage
             return HandleCommandResult(-errno.EINVAL, stderr=msg)
 
         completion = self.create_osds(drive_group)

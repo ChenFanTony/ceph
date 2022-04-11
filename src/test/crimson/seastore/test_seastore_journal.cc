@@ -80,16 +80,43 @@ struct journal_test_t : seastar_test_suite_t, SegmentProvider {
 
   segment_id_t next;
 
+  std::map<segment_id_t, segment_seq_t> segment_seqs;
+  std::map<segment_id_t, segment_type_t> segment_types;
+
   journal_test_t() = default;
+
+  seastar::lowres_system_clock::time_point get_last_modified(
+    segment_id_t id) const final {
+    return seastar::lowres_system_clock::time_point();
+  }
+
+  seastar::lowres_system_clock::time_point get_last_rewritten(
+    segment_id_t id) const final {
+    return seastar::lowres_system_clock::time_point();
+  }
 
   void update_segment_avail_bytes(paddr_t offset) final {}
 
-  segment_id_t get_segment(device_id_t id, segment_seq_t seq) final {
+  segment_id_t get_segment(
+    device_id_t id,
+    segment_seq_t seq,
+    segment_type_t type) final
+  {
     auto ret = next;
     next = segment_id_t{
       next.device_id(),
       next.device_segment_id() + 1};
+    segment_seqs[ret] = seq;
+    segment_types[ret] = type;
     return ret;
+  }
+
+  segment_seq_t get_seq(segment_id_t id) {
+    return segment_seqs[id];
+  }
+
+  segment_type_t get_type(segment_id_t id) final {
+    return segment_types[id];
   }
 
   journal_seq_t get_journal_tail_target() const final { return journal_seq_t{}; }
@@ -157,7 +184,7 @@ struct journal_test_t : seastar_test_suite_t, SegmentProvider {
     replay(
       [&advance,
        &delta_checker]
-      (const auto &offsets, const auto &di) mutable {
+      (const auto &offsets, const auto &di, auto t) mutable {
 	if (!delta_checker) {
 	  EXPECT_FALSE("No Deltas Left");
 	}
@@ -193,7 +220,10 @@ struct journal_test_t : seastar_test_suite_t, SegmentProvider {
     char contents = distribution(generator);
     bufferlist bl;
     bl.append(buffer::ptr(buffer::create(blocks * block_size, contents)));
-    return extent_t{extent_types_t::TEST_BLOCK, L_ADDR_NULL, bl};
+    return extent_t{
+      extent_types_t::TEST_BLOCK,
+      L_ADDR_NULL,
+      bl};
   }
 
   delta_info_t generate_delta(size_t bytes) {
@@ -211,6 +241,8 @@ struct journal_test_t : seastar_test_suite_t, SegmentProvider {
       0, 0,
       block_size,
       1,
+      MAX_SEG_SEQ,
+      segment_type_t::NULL_SEG,
       bl
     };
   }

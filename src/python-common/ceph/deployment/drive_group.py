@@ -149,7 +149,7 @@ class DriveGroupSpec(ServiceSpec):
         "db_slots", "wal_slots", "block_db_size", "placement", "service_id", "service_type",
         "data_devices", "db_devices", "wal_devices", "journal_devices",
         "data_directories", "osds_per_device", "objectstore", "osd_id_claims",
-        "journal_size", "unmanaged", "filter_logic", "preview_only",
+        "journal_size", "unmanaged", "filter_logic", "preview_only", "extra_container_args",
         "data_allocate_fraction", "method"
     ]
 
@@ -208,6 +208,7 @@ class DriveGroupSpec(ServiceSpec):
 
         #: Number of osd daemons per "DATA" device.
         #: To fully utilize nvme devices multiple osds are required.
+        #: Can be used to split dual-actuator devices across 2 OSDs, by setting the option to 2.
         self.osds_per_device = osds_per_device
 
         #: A list of strings, containing paths which should back OSDs

@@ -80,26 +80,13 @@ std::ostream& operator<<(std::ostream& out, segment_type_t t)
   }
 }
 
-segment_type_t segment_seq_to_type(segment_seq_t seq)
-{
-  if (seq <= MAX_VALID_SEG_SEQ) {
-    return segment_type_t::JOURNAL;
-  } else if (seq == OOL_SEG_SEQ) {
-    return segment_type_t::OOL;
-  } else {
-    assert(seq == NULL_SEG_SEQ);
-    return segment_type_t::NULL_SEG;
-  }
-}
-
 std::ostream& operator<<(std::ostream& out, segment_seq_printer_t seq)
 {
-  auto type = segment_seq_to_type(seq.seq);
-  switch(type) {
-  case segment_type_t::JOURNAL:
+  if (seq.seq == NULL_SEG_SEQ) {
+    return out << "NULL_SEG_SEQ";
+  } else {
+    assert(seq.seq <= MAX_VALID_SEG_SEQ);
     return out << seq.seq;
-  default:
-    return out << type;
   }
 }
 
@@ -211,6 +198,8 @@ std::ostream &operator<<(std::ostream &out, const delta_info_t &delta)
 	     << ", final_crc: " << delta.final_crc
 	     << ", length: " << delta.length
 	     << ", pversion: " << delta.pversion
+	     << ", ext_seq: " << delta.ext_seq
+	     << ", seg_type: " << delta.seg_type
 	     << ")";
 }
 
@@ -226,10 +215,23 @@ std::ostream &operator<<(std::ostream &out, const extent_info_t &info)
 std::ostream &operator<<(std::ostream &out, const segment_header_t &header)
 {
   return out << "segment_header_t("
-	     << "segment_seq=" << segment_seq_printer_t{header.journal_segment_seq}
+	     << "segment_seq=" << segment_seq_printer_t{header.segment_seq}
 	     << ", segment_id=" << header.physical_segment_id
 	     << ", journal_tail=" << header.journal_tail
 	     << ", segment_nonce=" << header.segment_nonce
+	     << ", type=" << header.type
+	     << ")";
+}
+
+std::ostream &operator<<(std::ostream &out, const segment_tail_t &tail)
+{
+  return out << "segment_tail_t("
+	     << "segment_seq=" << tail.segment_seq
+	     << ", segment_id=" << tail.physical_segment_id
+	     << ", journal_tail=" << tail.journal_tail
+	     << ", segment_nonce=" << tail.segment_nonce
+	     << ", last_modified=" << tail.last_modified
+	     << ", last_rewritten=" << tail.last_rewritten
 	     << ")";
 }
 
@@ -365,6 +367,8 @@ ceph::bufferlist encode_records(
     record_header_t rheader{
       (extent_len_t)r.deltas.size(),
       (extent_len_t)r.extents.size(),
+      r.commit_time,
+      r.commit_type
     };
     encode(rheader, bl);
   }
@@ -467,8 +471,6 @@ bool validate_records_data(
   return success;
 }
 
-namespace {
-
 std::optional<std::vector<record_header_t>>
 try_decode_record_headers(
     const record_group_header_t& header,
@@ -490,8 +492,6 @@ try_decode_record_headers(
     }
   }
   return record_headers;
-}
-
 }
 
 std::optional<std::vector<record_extent_infos_t> >
@@ -561,7 +561,8 @@ try_decode_deltas(
     result_iter->deltas.resize(r.header.deltas);
     for (auto& i: result_iter->deltas) {
       try {
-        decode(i, bliter);
+        decode(i.second, bliter);
+	i.first = r.header.commit_time;
       } catch (ceph::buffer::error &e) {
         journal_logger().debug(
             "try_decode_deltas: failed, "

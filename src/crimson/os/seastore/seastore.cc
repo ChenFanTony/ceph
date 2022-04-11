@@ -345,6 +345,10 @@ SeaStore::mkfs_ertr::future<> SeaStore::mkfs(uuid_d new_osd_fsid)
         transaction_manager->add_segment_manager(segment_manager.get());
         return transaction_manager->mkfs();
       }).safe_then([this] {
+        for (auto& sec_sm : secondaries) {
+          transaction_manager->add_segment_manager(sec_sm.get());
+        }
+        transaction_manager->add_segment_manager(segment_manager.get());
         return transaction_manager->mount();
       }).safe_then([this] {
         return repeat_eagain([this] {
@@ -1092,6 +1096,24 @@ SeaStore::tm_ret SeaStore::_do_transaction_step(
       return _setattrs(ctx, get_onode(op->oid), std::move(to_set));
     }
     break;
+    case Transaction::OP_SETATTRS:
+    {
+      std::map<std::string, bufferlist> to_set;
+      i.decode_attrset(to_set);
+      return _setattrs(ctx, get_onode(op->oid), std::move(to_set));
+    }
+    break;
+    case Transaction::OP_RMATTR:
+    {
+      std::string name = i.decode_string();
+      return _rmattr(ctx, get_onode(op->oid), name);
+    }
+    break;
+    case Transaction::OP_RMATTRS:
+    {
+      return _rmattrs(ctx, get_onode(op->oid));
+    }
+    break;
     case Transaction::OP_MKCOLL:
     {
       coll_t cid = i.get_cid(op->cid);
@@ -1135,6 +1157,10 @@ SeaStore::tm_ret SeaStore::_do_transaction_step(
 	std::move(first), std::move(last));
     }
     break;
+    case Transaction::OP_OMAP_CLEAR:
+    {
+      return _omap_clear(ctx, get_onode(op->oid));
+    }
     case Transaction::OP_COLL_HINT:
     {
       ceph::bufferlist hint;
@@ -1259,6 +1285,37 @@ SeaStore::tm_ret SeaStore::_omap_set_header(
   return tm_iertr::now();
 }
 
+SeaStore::tm_ret SeaStore::_omap_clear(
+  internal_context_t &ctx,
+  OnodeRef &onode)
+{
+  LOG_PREFIX(SeaStore::_omap_clear);
+  DEBUGT("{} {} keys", *ctx.transaction, *onode);
+  if (auto omap_root = onode->get_layout().omap_root.get(
+    onode->get_metadata_hint(segment_manager->get_block_size()));
+    omap_root.is_null()) {
+    return seastar::now();
+  } else {
+    return seastar::do_with(
+      BtreeOMapManager(*transaction_manager),
+      onode->get_layout().omap_root.get(
+        onode->get_metadata_hint(segment_manager->get_block_size())),
+      [&ctx, &onode](
+      auto &omap_manager,
+      auto &omap_root) {
+      return omap_manager.omap_clear(
+        omap_root,
+        *ctx.transaction)
+      .si_then([&] {
+        if (omap_root.must_update()) {
+          onode->get_mutable_layout(*ctx.transaction
+          ).omap_root.update(omap_root);
+        }
+      });
+    });
+  }
+}
+
 SeaStore::tm_ret SeaStore::_omap_rmkeys(
   internal_context_t &ctx,
   OnodeRef &onode,
@@ -1365,7 +1422,7 @@ SeaStore::tm_ret SeaStore::_setattrs(
 	val.c_str(),
 	val.length(),
 	onode_layout_t::MAX_SS_LENGTH);
-      it = aset.erase(it);
+      aset.erase(it);
     } else {
       layout.ss_size = 0;
     }
@@ -1381,6 +1438,100 @@ SeaStore::tm_ret SeaStore::_setattrs(
     *ctx.transaction,
     layout.xattr_root,
     std::move(aset));
+}
+
+SeaStore::tm_ret SeaStore::_rmattr(
+  internal_context_t &ctx,
+  OnodeRef &onode,
+  std::string name)
+{
+  LOG_PREFIX(SeaStore::_rmattr);
+  DEBUGT("onode={}", *ctx.transaction, *onode);
+  auto& layout = onode->get_mutable_layout(*ctx.transaction);
+  if ((name == OI_ATTR) && (layout.oi_size > 0)) {
+    memset(&layout.oi[0], 0, layout.oi_size);
+    layout.oi_size = 0;
+    return tm_iertr::now();
+  } else if ((name == SS_ATTR) && (layout.ss_size > 0)) {
+    memset(&layout.ss[0], 0, layout.ss_size);
+    layout.ss_size = 0;
+    return tm_iertr::now();
+  } else {
+    return _xattr_rmattr(
+      ctx,
+      onode,
+      std::move(name));
+  }
+}
+
+SeaStore::tm_ret SeaStore::_xattr_rmattr(
+  internal_context_t &ctx,
+  OnodeRef &onode,
+  std::string &&name)
+{
+  LOG_PREFIX(SeaStore::_xattr_rmattr);
+  DEBUGT("onode={}", *ctx.transaction, *onode);
+  auto xattr_root = onode->get_layout().xattr_root.get(
+    onode->get_metadata_hint(segment_manager->get_block_size()));
+  if (xattr_root.is_null()) {
+    return seastar::now();
+  } else {
+    return seastar::do_with(
+      BtreeOMapManager(*transaction_manager),
+      onode->get_layout().xattr_root.get(
+        onode->get_metadata_hint(segment_manager->get_block_size())),
+      std::move(name),
+      [&ctx, &onode](auto &omap_manager, auto &xattr_root, auto &name) {
+        return omap_manager.omap_rm_key(xattr_root, *ctx.transaction, name)
+          .si_then([&] {
+          if (xattr_root.must_update()) {
+              onode->get_mutable_layout(*ctx.transaction
+              ).xattr_root.update(xattr_root);
+          }
+        });
+    });
+  }
+}
+
+SeaStore::tm_ret SeaStore::_rmattrs(
+  internal_context_t &ctx,
+  OnodeRef &onode)
+{
+  LOG_PREFIX(SeaStore::_rmattrs);
+  DEBUGT("onode={}", *ctx.transaction, *onode);
+  auto& layout = onode->get_mutable_layout(*ctx.transaction);
+  memset(&layout.oi[0], 0, layout.oi_size);
+  layout.oi_size = 0;
+  memset(&layout.ss[0], 0, layout.ss_size);
+  layout.ss_size = 0;
+  return _xattr_clear(ctx, onode);
+}
+
+SeaStore::tm_ret SeaStore::_xattr_clear(
+  internal_context_t &ctx,
+  OnodeRef &onode)
+{
+  LOG_PREFIX(SeaStore::_xattr_clear);
+  DEBUGT("onode={}", *ctx.transaction, *onode);
+  auto xattr_root = onode->get_layout().xattr_root.get(
+    onode->get_metadata_hint(segment_manager->get_block_size()));
+  if (xattr_root.is_null()) {
+    return seastar::now();
+  } else {
+    return seastar::do_with(
+      BtreeOMapManager(*transaction_manager),
+      onode->get_layout().xattr_root.get(
+	onode->get_metadata_hint(segment_manager->get_block_size())),
+      [&ctx, &onode](auto &omap_manager, auto &xattr_root) {
+        return omap_manager.omap_clear(xattr_root, *ctx.transaction)
+	  .si_then([&] {
+	  if (xattr_root.must_update()) {
+              onode->get_mutable_layout(*ctx.transaction
+              ).xattr_root.update(xattr_root);
+          }
+        });
+    });
+  }
 }
 
 SeaStore::tm_ret SeaStore::_create_collection(
@@ -1509,27 +1660,7 @@ seastar::future<std::unique_ptr<SeaStore>> make_seastore(
   return SegmentManager::get_segment_manager(
     device
   ).then([&device](auto sm) {
-    auto scanner = std::make_unique<ExtentReader>();
-    auto& scanner_ref = *scanner.get();
-    auto segment_cleaner = std::make_unique<SegmentCleaner>(
-      SegmentCleaner::config_t::get_default(),
-      std::move(scanner),
-      false /* detailed */);
-
-    auto journal = journal::make_segmented(*sm, scanner_ref, *segment_cleaner);
-    auto epm = std::make_unique<ExtentPlacementManager>();
-    auto cache = std::make_unique<Cache>(scanner_ref, *epm);
-    auto lba_manager = lba_manager::create_lba_manager(*sm, *cache);
-
-    auto tm = std::make_unique<TransactionManager>(
-      *sm,
-      std::move(segment_cleaner),
-      std::move(journal),
-      std::move(cache),
-      std::move(lba_manager),
-      std::move(epm),
-      scanner_ref);
-
+    auto tm = make_transaction_manager(*sm, false /* detailed */);
     auto cm = std::make_unique<collection_manager::FlatCollectionManager>(*tm);
     return std::make_unique<SeaStore>(
       device,

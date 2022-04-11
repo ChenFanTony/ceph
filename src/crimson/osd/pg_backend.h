@@ -128,7 +128,13 @@ public:
     const OSDOp& osd_op,
     ceph::os::Transaction& trans,
     object_stat_sum_t& delta_stats);
-  interruptible_future<> remove(
+  using remove_ertr = crimson::errorator<
+    crimson::ct_error::enoent>;
+  using remove_iertr =
+    ::crimson::interruptible::interruptible_errorator<
+      ::crimson::osd::IOInterruptCondition,
+      remove_ertr>;
+  remove_iertr::future<> remove(
     ObjectState& os,
     ceph::os::Transaction& txn,
     object_stat_sum_t& delta_stats);
@@ -205,11 +211,16 @@ public:
   get_attr_ierrorator::future<ceph::bufferlist> getxattr(
     const hobject_t& soid,
     std::string_view key) const;
+  get_attr_ierrorator::future<ceph::bufferlist> getxattr(
+    const hobject_t& soid,
+    std::string&& key) const;
   get_attr_ierrorator::future<> get_xattrs(
     const ObjectState& os,
     OSDOp& osd_op,
     object_stat_sum_t& delta_stats) const;
-  using cmp_xattr_errorator = ::crimson::os::FuturizedStore::get_attr_errorator;
+  using cmp_xattr_errorator = get_attr_errorator::extend<
+    crimson::ct_error::ecanceled,
+    crimson::ct_error::invarg>;
   using cmp_xattr_ierrorator =
     ::crimson::interruptible::interruptible_errorator<
       ::crimson::osd::IOInterruptCondition,
@@ -238,6 +249,18 @@ public:
 
   // OMAP
   ll_read_ierrorator::future<> omap_get_keys(
+    const ObjectState& os,
+    OSDOp& osd_op,
+    object_stat_sum_t& delta_stats) const;
+  using omap_cmp_ertr =
+    crimson::os::FuturizedStore::read_errorator::extend<
+      crimson::ct_error::ecanceled,
+      crimson::ct_error::invarg>;
+  using omap_cmp_iertr =
+    ::crimson::interruptible::interruptible_errorator<
+      ::crimson::osd::IOInterruptCondition,
+      omap_cmp_ertr>;
+  omap_cmp_iertr::future<> omap_cmp(
     const ObjectState& os,
     OSDOp& osd_op,
     object_stat_sum_t& delta_stats) const;

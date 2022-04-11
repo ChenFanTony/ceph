@@ -48,10 +48,12 @@ FuncT = TypeVar('FuncT', bound=Callable)
 DEFAULT_IMAGE = 'quay.ceph.io/ceph-ci/ceph:master'
 DEFAULT_IMAGE_IS_MASTER = True
 DEFAULT_IMAGE_RELEASE = 'quincy'
-DEFAULT_PROMETHEUS_IMAGE = 'quay.io/prometheus/prometheus:v2.18.1'
-DEFAULT_NODE_EXPORTER_IMAGE = 'quay.io/prometheus/node-exporter:v0.18.1'
-DEFAULT_ALERT_MANAGER_IMAGE = 'quay.io/prometheus/alertmanager:v0.20.0'
-DEFAULT_GRAFANA_IMAGE = 'quay.io/ceph/ceph-grafana:6.7.4'
+DEFAULT_PROMETHEUS_IMAGE = 'quay.io/prometheus/prometheus:v2.33.4'
+DEFAULT_LOKI_IMAGE = 'docker.io/grafana/loki:2.4.0'
+DEFAULT_PROMTAIL_IMAGE = 'docker.io/grafana/promtail:2.4.0'
+DEFAULT_NODE_EXPORTER_IMAGE = 'quay.io/prometheus/node-exporter:v1.3.1'
+DEFAULT_ALERT_MANAGER_IMAGE = 'quay.io/prometheus/alertmanager:v0.23.0'
+DEFAULT_GRAFANA_IMAGE = 'quay.io/ceph/ceph-grafana:8.3.5'
 DEFAULT_HAPROXY_IMAGE = 'docker.io/library/haproxy:2.3'
 DEFAULT_KEEPALIVED_IMAGE = 'docker.io/arcts/keepalived'
 DEFAULT_SNMP_GATEWAY_IMAGE = 'docker.io/maxwo/snmp-notifier:v1.2.1'
@@ -426,6 +428,8 @@ class Monitoring(object):
         'node-exporter': [9100],
         'grafana': [3000],
         'alertmanager': [9093, 9094],
+        'loki': [3100],
+        'promtail': [9080]
     }
 
     components = {
@@ -439,6 +443,28 @@ class Monitoring(object):
             ],
             'config-json-files': [
                 'prometheus.yml',
+            ],
+        },
+        'loki': {
+            'image': DEFAULT_LOKI_IMAGE,
+            'cpus': '1',
+            'memory': '1GB',
+            'args': [
+                '--config.file=/etc/loki/loki.yml',
+            ],
+            'config-json-files': [
+                'loki.yml'
+            ],
+        },
+        'promtail': {
+            'image': DEFAULT_PROMTAIL_IMAGE,
+            'cpus': '1',
+            'memory': '1GB',
+            'args': [
+                '--config.file=/etc/promtail/promtail.yml',
+            ],
+            'config-json-files': [
+                'promtail.yml',
             ],
         },
         'node-exporter': {
@@ -481,9 +507,9 @@ class Monitoring(object):
     def get_version(ctx, container_id, daemon_type):
         # type: (CephadmContext, str, str) -> str
         """
-        :param: daemon_type Either "prometheus", "alertmanager" or "node-exporter"
+        :param: daemon_type Either "prometheus", "alertmanager", "loki", "promtail" or "node-exporter"
         """
-        assert daemon_type in ('prometheus', 'alertmanager', 'node-exporter')
+        assert daemon_type in ('prometheus', 'alertmanager', 'node-exporter', 'loki', 'promtail')
         cmd = daemon_type.replace('-', '_')
         code = -1
         err = ''
@@ -787,6 +813,10 @@ class CephIscsi(object):
         # remove extra container args for tcmu container.
         # extra args could cause issue with forking service type
         tcmu_container.container_args = []
+        # set container limits to unlimited as defaults (Docker 4096 / Podman 2048)
+        # prevents the creation of max lun (default 255)
+        pids_unlimited = '-1' if isinstance(self.ctx.container_engine, Podman) else '0'
+        tcmu_container.container_args.extend(['--pids-limit=%s' % pids_unlimited])
         return tcmu_container
 
 ##################################
@@ -1868,16 +1898,26 @@ def infer_config(func: FuncT) -> FuncT:
         if ctx.config:
             logger.debug('Using specified config: %s' % ctx.config)
             return func(ctx)
+
+        def config_path(daemon_type: str, daemon_name: str) -> str:
+            data_dir = get_data_dir(ctx.fsid, ctx.data_dir, daemon_type, daemon_name)
+            return os.path.join(data_dir, 'config')
+
         if 'fsid' in ctx and ctx.fsid:
             name = ctx.name if 'name' in ctx else None
             if not name:
                 daemon_list = list_daemons(ctx, detail=False)
                 for daemon in daemon_list:
-                    if daemon.get('name', '').startswith('mon.') and daemon.get('fsid', '') == ctx.fsid:
+                    if (
+                        daemon.get('name', '').startswith('mon.')
+                        and daemon.get('fsid', '') == ctx.fsid
+                        and daemon.get('style', '') == 'cephadm:v1'
+                        and os.path.exists(config_path('mon', daemon['name'].split('.', 1)[1]))
+                    ):
                         name = daemon['name']
                         break
             if name:
-                ctx.config = f'/var/lib/ceph/{ctx.fsid}/{name}/config'
+                ctx.config = config_path(name.split('.', 1)[0], name.split('.', 1)[1])
         if ctx.config:
             logger.info('Inferring config %s' % ctx.config)
         elif os.path.exists(SHELL_DEFAULT_CONF):
@@ -2340,7 +2380,7 @@ def get_daemon_args(ctx, fsid, daemon_type, daemon_id):
         metadata = Monitoring.components[daemon_type]
         r += metadata.get('args', list())
         # set ip and port to bind to for nodeexporter,alertmanager,prometheus
-        if daemon_type != 'grafana':
+        if daemon_type not in ['grafana', 'loki', 'promtail']:
             ip = ''
             port = Monitoring.port_map[daemon_type][0]
             if 'meta_json' in ctx and ctx.meta_json:
@@ -2357,6 +2397,14 @@ def get_daemon_args(ctx, fsid, daemon_type, daemon_id):
                 r += ['--cluster.peer={}'.format(peer)]
             # some alertmanager, by default, look elsewhere for a config
             r += ['--config.file=/etc/alertmanager/alertmanager.yml']
+        if daemon_type == 'loki':
+            r += ['--config.file=/etc/loki/loki.yml']
+        if daemon_type == 'promtail':
+            r += ['--config.file=/etc/promtail/promtail.yml']
+        if daemon_type == 'node-exporter':
+            r += ['--path.procfs=/host/proc',
+                  '--path.sysfs=/host/sys',
+                  '--path.rootfs=/rootfs']
     elif daemon_type == NFSGanesha.daemon_type:
         nfs_ganesha = NFSGanesha.init(ctx, fsid, daemon_id)
         r += nfs_ganesha.get_daemon_args()
@@ -2427,6 +2475,18 @@ def create_daemon_dirs(ctx, fsid, daemon_type, daemon_id, uid, gid,
             config_dir = 'etc/alertmanager'
             makedirs(os.path.join(data_dir_root, config_dir), uid, gid, 0o755)
             makedirs(os.path.join(data_dir_root, config_dir, 'data'), uid, gid, 0o755)
+        elif daemon_type == 'promtail':
+            data_dir_root = get_data_dir(fsid, ctx.data_dir,
+                                         daemon_type, daemon_id)
+            config_dir = 'etc/promtail'
+            makedirs(os.path.join(data_dir_root, config_dir), uid, gid, 0o755)
+            makedirs(os.path.join(data_dir_root, 'data'), uid, gid, 0o755)
+        elif daemon_type == 'loki':
+            data_dir_root = get_data_dir(fsid, ctx.data_dir,
+                                         daemon_type, daemon_id)
+            config_dir = 'etc/loki'
+            makedirs(os.path.join(data_dir_root, config_dir), uid, gid, 0o755)
+            makedirs(os.path.join(data_dir_root, 'data'), uid, gid, 0o755)
 
         # populate the config directory for the component from the config-json
         if 'files' in config_json:
@@ -2612,9 +2672,17 @@ def get_container_mounts(ctx, fsid, daemon_type, daemon_id,
 
     if daemon_type in Monitoring.components and daemon_id:
         data_dir = get_data_dir(fsid, ctx.data_dir, daemon_type, daemon_id)
+        log_dir = get_log_dir(fsid, ctx.log_dir)
         if daemon_type == 'prometheus':
             mounts[os.path.join(data_dir, 'etc/prometheus')] = '/etc/prometheus:Z'
             mounts[os.path.join(data_dir, 'data')] = '/prometheus:Z'
+        elif daemon_type == 'loki':
+            mounts[os.path.join(data_dir, 'etc/loki')] = '/etc/loki:Z'
+            mounts[os.path.join(data_dir, 'data')] = '/loki:Z'
+        elif daemon_type == 'promtail':
+            mounts[os.path.join(data_dir, 'etc/promtail')] = '/etc/promtail:Z'
+            mounts[log_dir] = '/var/log/ceph:z'
+            mounts[os.path.join(data_dir, 'data')] = '/promtail:Z'
         elif daemon_type == 'node-exporter':
             mounts['/proc'] = '/host/proc:ro'
             mounts['/sys'] = '/host/sys:ro'
@@ -2732,6 +2800,8 @@ def get_container(ctx: CephadmContext,
         envs.extend(Keepalived.get_container_envs())
         container_args.extend(['--cap-add=NET_ADMIN', '--cap-add=NET_RAW'])
     elif daemon_type == CephIscsi.daemon_type:
+        # Applies only on rbd-target-api as get_tcmu_runner_container()
+        # removes all tcmu-runner arguments
         entrypoint = CephIscsi.entrypoint
         name = '%s.%s' % (daemon_type, daemon_id)
         # So the container can modprobe iscsi_target_mod and have write perms
@@ -2753,6 +2823,11 @@ def get_container(ctx: CephadmContext,
             # by ubuntu 18.04 kernel!)
         ]
         container_args.extend(monitoring_args)
+        if daemon_type == 'node-exporter':
+            # in order to support setting '--path.procfs=/host/proc','--path.sysfs=/host/sys',
+            # '--path.rootfs=/rootfs' for node-exporter we need to disable selinux separation
+            # between the node-exporter container and the host to avoid selinux denials
+            container_args.extend(['--security-opt', 'label=disable'])
     elif daemon_type == 'crash':
         ceph_args = ['-n', name]
     elif daemon_type in Ceph.daemons:
@@ -2765,6 +2840,8 @@ def get_container(ctx: CephadmContext,
 
     # if using podman, set -d, --conmon-pidfile & --cidfile flags
     # so service can have Type=Forking
+    # set containers limits to unlimited as defaults (Docker 4096 / Podman 2048)
+    # prevents some app customizations from running
     if isinstance(ctx.container_engine, Podman):
         runtime_dir = '/run'
         container_args.extend([
@@ -2773,9 +2850,14 @@ def get_container(ctx: CephadmContext,
             runtime_dir + '/ceph-%s@%s.%s.service-pid' % (fsid, daemon_type, daemon_id),
             '--cidfile',
             runtime_dir + '/ceph-%s@%s.%s.service-cid' % (fsid, daemon_type, daemon_id),
+            '--pids-limit=-1',
         ])
         if ctx.container_engine.version >= CGROUPS_SPLIT_PODMAN_VERSION:
             container_args.append('--cgroups=split')
+    else:
+        container_args.extend([
+            '--pids-limit=0',
+        ])
 
     return CephContainer.for_daemon(
         ctx,
@@ -3260,9 +3342,10 @@ class Firewalld(object):
 
 def update_firewalld(ctx, daemon_type):
     # type: (CephadmContext, str) -> None
-    firewall = Firewalld(ctx)
-    firewall.enable_service_for(daemon_type)
-    firewall.apply_rules()
+    if not ('skip_firewalld' in ctx and ctx.skip_firewalld):
+        firewall = Firewalld(ctx)
+        firewall.enable_service_for(daemon_type)
+        firewall.apply_rules()
 
 
 def install_sysctl(ctx: CephadmContext, fsid: str, daemon_type: str) -> None:
@@ -4178,7 +4261,7 @@ def command_version(ctx):
 ##################################
 
 
-@infer_image
+@default_image
 def command_pull(ctx):
     # type: (CephadmContext) -> int
 
@@ -4294,6 +4377,7 @@ def check_subnet(subnets: str) -> Tuple[int, List[int], str]:
     subnet_list = subnets.split(',')
     for subnet in subnet_list:
         # ensure the format of the string is as expected address/netmask
+        subnet = subnet.strip()
         if not re.search(r'\/\d+$', subnet):
             rc = 1
             errors.append(f'{subnet} is not in CIDR format (address/netmask)')
@@ -4392,7 +4476,11 @@ def prepare_mon_addresses(
     logger.debug('Base mon IP is %s, final addrv is %s' % (base_ip, addr_arg))
 
     mon_network = None
-    if not ctx.skip_mon_network:
+    cp = read_config(ctx.config)
+    if cp.has_option('global', 'public_network'):
+        mon_network = cp.get('global', 'public_network')
+
+    if mon_network is None and not ctx.skip_mon_network:
         # make sure IP is configured locally, and then figure out the
         # CIDR network
         errmsg = f'Cannot infer CIDR network for mon IP `{base_ip}`'
@@ -4415,18 +4503,21 @@ def prepare_mon_addresses(
 
 
 def prepare_cluster_network(ctx: CephadmContext) -> Tuple[str, bool]:
-    cluster_network = ''
     ipv6_cluster_network = False
     # the cluster network may not exist on this node, so all we can do is
     # validate that the address given is valid ipv4 or ipv6 subnet
-    if ctx.cluster_network:
-        rc, versions, err_msg = check_subnet(ctx.cluster_network)
+    cp = read_config(ctx.config)
+    cluster_network = ctx.cluster_network
+    if cluster_network is None and cp.has_option('global', 'cluster_network'):
+        cluster_network = cp.get('global', 'cluster_network')
+
+    if cluster_network:
+        rc, versions, err_msg = check_subnet(cluster_network)
         if rc:
             raise Error(f'Invalid --cluster-network parameter: {err_msg}')
-        cluster_network = ctx.cluster_network
         ipv6_cluster_network = True if 6 in versions else False
     else:
-        logger.info('- internal network (--cluster-network) has not '
+        logger.info('Internal network (--cluster-network) has not '
                     'been provided, OSD replication will default to '
                     'the public_network')
 
@@ -4764,9 +4855,10 @@ def prepare_dashboard(
     port = int(out)
 
     # Open dashboard port
-    fw = Firewalld(ctx)
-    fw.open_ports([port])
-    fw.apply_rules()
+    if not ('skip_firewalld' in ctx and ctx.skip_firewalld):
+        fw = Firewalld(ctx)
+        fw.open_ports([port])
+        fw.apply_rules()
 
     logger.info('Ceph Dashboard is now available at:\n\n'
                 '\t     URL: https://%s:%s/\n'
@@ -4964,6 +5056,13 @@ def command_bootstrap(ctx):
                                           'ceph.client.admin.keyring')
     if not ctx.output_pub_ssh_key:
         ctx.output_pub_ssh_key = os.path.join(ctx.output_dir, 'ceph.pub')
+
+    if ctx.fsid:
+        data_dir_base = os.path.join(ctx.data_dir, ctx.fsid)
+        if os.path.exists(data_dir_base):
+            raise Error(f"A cluster with the same fsid '{ctx.fsid}' already exists.")
+        else:
+            logger.warning('Specifying an fsid for your cluster offers no advantages and may increase the likelihood of fsid conflicts.')
 
     # verify output files
     for f in [ctx.output_config, ctx.output_keyring,
@@ -5236,6 +5335,10 @@ def extract_uid_gid_monitoring(ctx, daemon_type):
         uid, gid = 65534, 65534
     elif daemon_type == 'grafana':
         uid, gid = extract_uid_gid(ctx, file_path='/var/lib/grafana')
+    elif daemon_type == 'loki':
+        uid, gid = extract_uid_gid(ctx, file_path='/etc/loki')
+    elif daemon_type == 'promtail':
+        uid, gid = extract_uid_gid(ctx, file_path='/etc/promtail')
     elif daemon_type == 'alertmanager':
         uid, gid = extract_uid_gid(ctx, file_path=['/etc/alertmanager', '/etc/prometheus'])
     else:
@@ -5881,7 +5984,9 @@ def list_daemons(ctx, detail=True, legacy_dir=None):
                                         seen_versions[image_id] = version
                                 elif daemon_type in ['prometheus',
                                                      'alertmanager',
-                                                     'node-exporter']:
+                                                     'node-exporter',
+                                                     'loki',
+                                                     'promtail']:
                                     version = Monitoring.get_version(ctx, container_id, daemon_type)
                                     seen_versions[image_id] = version
                                 elif daemon_type == 'haproxy':
@@ -7984,7 +8089,7 @@ def _get_parser():
     parser_version.set_defaults(func=command_version)
 
     parser_pull = subparsers.add_parser(
-        'pull', help='pull latest image version')
+        'pull', help='pull the default container image')
     parser_pull.set_defaults(func=command_pull)
     parser_pull.add_argument(
         '--insecure',
@@ -8041,7 +8146,7 @@ def _get_parser():
     parser_adopt.add_argument(
         '--skip-pull',
         action='store_true',
-        help='do not pull the latest image before adopting')
+        help='do not pull the default image before adopting')
     parser_adopt.add_argument(
         '--force-start',
         action='store_true',
@@ -8330,7 +8435,7 @@ def _get_parser():
     parser_bootstrap.add_argument(
         '--skip-pull',
         action='store_true',
-        help='do not pull the latest image before bootstrapping')
+        help='do not pull the default image before bootstrapping')
     parser_bootstrap.add_argument(
         '--skip-firewalld',
         action='store_true',

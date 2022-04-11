@@ -20,6 +20,7 @@ from .fixtures import (
     mock_docker,
     mock_podman,
     with_cephadm_ctx,
+    mock_bad_firewalld,
 )
 
 with mock.patch('builtins.open', create=True):
@@ -214,10 +215,43 @@ class TestCephAdm(object):
         for address, expected in tests:
             wrap_test(address, expected)
 
+    @mock.patch('cephadm.Firewalld', mock_bad_firewalld)
+    @mock.patch('cephadm.logger')
+    def test_skip_firewalld(self, logger, cephadm_fs):
+        """
+        test --skip-firewalld actually skips changing firewall
+        """
+
+        ctx = cd.CephadmContext()
+        with pytest.raises(Exception):
+            cd.update_firewalld(ctx, 'mon')
+
+        ctx.skip_firewalld = True
+        cd.update_firewalld(ctx, 'mon')
+
+        ctx.skip_firewalld = False
+        with pytest.raises(Exception):
+            cd.update_firewalld(ctx, 'mon')
+
+        ctx = cd.CephadmContext()
+        ctx.ssl_dashboard_port = 8888
+        ctx.dashboard_key = None
+        ctx.dashboard_password_noupdate = True
+        ctx.initial_dashboard_password = 'password'
+        ctx.initial_dashboard_user = 'User'
+        with pytest.raises(Exception):
+            cd.prepare_dashboard(ctx, 0, 0, lambda _, extra_mounts=None, ___=None : '5', lambda : None)
+
+        ctx.skip_firewalld = True
+        cd.prepare_dashboard(ctx, 0, 0, lambda _, extra_mounts=None, ___=None : '5', lambda : None)
+
+        ctx.skip_firewalld = False
+        with pytest.raises(Exception):
+            cd.prepare_dashboard(ctx, 0, 0, lambda _, extra_mounts=None, ___=None : '5', lambda : None)
+
     @mock.patch('cephadm.call_throws')
     @mock.patch('cephadm.get_parm')
     def test_registry_login(self, get_parm, call_throws):
-
         # test normal valid login with url, username and password specified
         call_throws.return_value = '', '', 0
         ctx: cd.CephadmContext = cd.cephadm_init_ctx(
@@ -473,14 +507,21 @@ docker.io/ceph/daemon-base:octopus
                 '00000000-0000-0000-0000-0000deadbeef',
                 None,
                 None,
-                [{'name': 'mon.a', 'fsid': '00000000-0000-0000-0000-0000deadbeef'}],
+                [{'name': 'mon.a', 'fsid': '00000000-0000-0000-0000-0000deadbeef', 'style': 'cephadm:v1'}],
                 '/var/lib/ceph/00000000-0000-0000-0000-0000deadbeef/mon.a/config',
             ),
             (
                 '00000000-0000-0000-0000-0000deadbeef',
                 None,
                 None,
-                [{'name': 'mon.a', 'fsid': 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'}],
+                [{'name': 'mon.a', 'fsid': 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'style': 'cephadm:v1'}],
+                cd.SHELL_DEFAULT_CONF,
+            ),
+            (
+                '00000000-0000-0000-0000-0000deadbeef',
+                None,
+                None,
+                [{'name': 'mon.a', 'fsid': '00000000-0000-0000-0000-0000deadbeef', 'style': 'legacy'}],
                 cd.SHELL_DEFAULT_CONF,
             ),
             (
@@ -494,7 +535,7 @@ docker.io/ceph/daemon-base:octopus
                 '00000000-0000-0000-0000-0000deadbeef',
                 '/foo/bar.conf',
                 'mon.a',
-                [{'name': 'mon.a'}],
+                [{'name': 'mon.a', 'style': 'cephadm:v1'}],
                 '/foo/bar.conf',
             ),
             (
@@ -520,7 +561,8 @@ docker.io/ceph/daemon-base:octopus
             ),
         ])
     @mock.patch('cephadm.call')
-    def test_infer_config(self, _call, fsid, config, name, list_daemons, result, cephadm_fs):
+    @mock.patch('cephadm.logger')
+    def test_infer_config(self, logger, _call, fsid, config, name, list_daemons, result, cephadm_fs):
         # build the context
         ctx = cd.CephadmContext()
         ctx.fsid = fsid
@@ -532,8 +574,8 @@ docker.io/ceph/daemon-base:octopus
         mock_fn.return_value = 0
         infer_config = cd.infer_config(mock_fn)
 
-        # mock the shell config
-        cephadm_fs.create_file(cd.SHELL_DEFAULT_CONF)
+        # mock the config file
+        cephadm_fs.create_file(result)
 
         # test
         with mock.patch('cephadm.list_daemons', return_value=list_daemons):
@@ -1308,11 +1350,11 @@ if ! grep -qs /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id
 # iscsi tcmu-runner container
 ! /usr/bin/podman rm -f ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi.daemon_id-tcmu 2> /dev/null
 ! /usr/bin/podman rm -f ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id-tcmu 2> /dev/null
-/usr/bin/podman run --rm --ipc=host --stop-signal=SIGTERM --net=host --entrypoint /usr/bin/tcmu-runner --privileged --group-add=disk --init --name ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id-tcmu -e CONTAINER_IMAGE=ceph/ceph -e NODE_NAME=host1 -e CEPH_USE_RANDOM_NONCE=1 -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/config:/etc/ceph/ceph.conf:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/keyring:/etc/ceph/keyring:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/iscsi-gateway.cfg:/etc/ceph/iscsi-gateway.cfg:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/configfs:/sys/kernel/config -v /var/log/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9:/var/log:z -v /dev:/dev --mount type=bind,source=/lib/modules,destination=/lib/modules,ro=true ceph/ceph &
+/usr/bin/podman run --rm --ipc=host --stop-signal=SIGTERM --net=host --entrypoint /usr/bin/tcmu-runner --privileged --group-add=disk --init --name ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id-tcmu --pids-limit=0 -e CONTAINER_IMAGE=ceph/ceph -e NODE_NAME=host1 -e CEPH_USE_RANDOM_NONCE=1 -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/config:/etc/ceph/ceph.conf:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/keyring:/etc/ceph/keyring:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/iscsi-gateway.cfg:/etc/ceph/iscsi-gateway.cfg:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/configfs:/sys/kernel/config -v /var/log/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9:/var/log:z -v /dev:/dev --mount type=bind,source=/lib/modules,destination=/lib/modules,ro=true ceph/ceph &
 # iscsi.daemon_id
 ! /usr/bin/podman rm -f ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi.daemon_id 2> /dev/null
 ! /usr/bin/podman rm -f ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id 2> /dev/null
-/usr/bin/podman run --rm --ipc=host --stop-signal=SIGTERM --net=host --entrypoint /usr/bin/rbd-target-api --privileged --group-add=disk --init --name ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id -e CONTAINER_IMAGE=ceph/ceph -e NODE_NAME=host1 -e CEPH_USE_RANDOM_NONCE=1 -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/config:/etc/ceph/ceph.conf:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/keyring:/etc/ceph/keyring:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/iscsi-gateway.cfg:/etc/ceph/iscsi-gateway.cfg:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/configfs:/sys/kernel/config -v /var/log/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9:/var/log:z -v /dev:/dev --mount type=bind,source=/lib/modules,destination=/lib/modules,ro=true ceph/ceph
+/usr/bin/podman run --rm --ipc=host --stop-signal=SIGTERM --net=host --entrypoint /usr/bin/rbd-target-api --privileged --group-add=disk --init --name ceph-9b9d7609-f4d5-4aba-94c8-effa764d96c9-iscsi-daemon_id --pids-limit=0 -e CONTAINER_IMAGE=ceph/ceph -e NODE_NAME=host1 -e CEPH_USE_RANDOM_NONCE=1 -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/config:/etc/ceph/ceph.conf:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/keyring:/etc/ceph/keyring:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/iscsi-gateway.cfg:/etc/ceph/iscsi-gateway.cfg:z -v /var/lib/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9/iscsi.daemon_id/configfs:/sys/kernel/config -v /var/log/ceph/9b9d7609-f4d5-4aba-94c8-effa764d96c9:/var/log:z -v /dev:/dev --mount type=bind,source=/lib/modules,destination=/lib/modules,ro=true ceph/ceph
 """
 
     def test_get_container(self):
@@ -1680,6 +1722,29 @@ class TestPull:
             cd.command_pull(ctx)
         assert err in str(e.value)
 
+    @mock.patch('cephadm.logger')
+    @mock.patch('cephadm.get_image_info_from_inspect', return_value={})
+    @mock.patch('cephadm.get_last_local_ceph_image', return_value='last_local_ceph_image')
+    def test_image(self, get_last_local_ceph_image, get_image_info_from_inspect, logger):
+        cmd = ['pull']
+        with with_cephadm_ctx(cmd) as ctx:
+            retval = cd.command_pull(ctx)
+            assert retval == 0
+            assert ctx.image == cd.DEFAULT_IMAGE
+
+        with mock.patch.dict(os.environ, {"CEPHADM_IMAGE": 'cephadm_image_environ'}):
+            cmd = ['pull']
+            with with_cephadm_ctx(cmd) as ctx:
+                retval = cd.command_pull(ctx)
+                assert retval == 0
+                assert ctx.image == 'cephadm_image_environ'
+
+            cmd = ['--image',  'cephadm_image_param', 'pull']
+            with with_cephadm_ctx(cmd) as ctx:
+                retval = cd.command_pull(ctx)
+                assert retval == 0
+                assert ctx.image == 'cephadm_image_param'
+
 
 class TestApplySpec:
 
@@ -1884,3 +1949,35 @@ class TestSNMPGateway:
             with pytest.raises(Exception) as e:
                 c = cd.get_container(ctx, fsid, 'snmp-gateway', 'daemon_id')
             assert str(e.value) == 'not a valid snmp version: V1'
+
+    def test_ipv4_subnet(self):
+        rc, v, msg = cd.check_subnet('192.168.1.0/24')
+        assert rc == 0 and v[0] == 4
+
+    def test_ipv4_subnet_list(self):
+        rc, v, msg = cd.check_subnet('192.168.1.0/24,10.90.90.0/24')
+        assert rc == 0 and not msg
+
+    def test_ipv4_subnet_list_with_spaces(self):
+        rc, v, msg = cd.check_subnet('192.168.1.0/24, 10.90.90.0/24 ')
+        assert rc == 0 and not msg
+
+    def test_ipv4_subnet_badlist(self):
+        rc, v, msg = cd.check_subnet('192.168.1.0/24,192.168.1.1')
+        assert rc == 1 and msg
+
+    def test_ipv4_subnet_mixed(self):
+        rc, v, msg = cd.check_subnet('192.168.100.0/24,fe80::/64')
+        assert rc == 0 and v == [4,6]
+
+    def test_ipv6_subnet(self):
+        rc, v, msg = cd.check_subnet('fe80::/64')
+        assert rc == 0 and v[0] == 6
+
+    def test_subnet_mask_missing(self):
+        rc, v, msg = cd.check_subnet('192.168.1.58')
+        assert rc == 1 and msg
+
+    def test_subnet_mask_junk(self):
+        rc, v, msg = cd.check_subnet('wah')
+        assert rc == 1 and msg

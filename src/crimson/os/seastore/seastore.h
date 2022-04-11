@@ -347,6 +347,9 @@ private:
     internal_context_t &ctx,
     OnodeRef &onode,
     ceph::bufferlist &&header);
+  tm_ret _omap_clear(
+    internal_context_t &ctx,
+    OnodeRef &onode);
   tm_ret _omap_rmkeys(
     internal_context_t &ctx,
     OnodeRef &onode,
@@ -363,6 +366,20 @@ private:
     internal_context_t &ctx,
     OnodeRef &onode,
     std::map<std::string,bufferlist>&& aset);
+  tm_ret _rmattr(
+    internal_context_t &ctx,
+    OnodeRef &onode,
+    std::string name);
+  tm_ret _rmattrs(
+    internal_context_t &ctx,
+    OnodeRef &onode);
+  tm_ret _xattr_rmattr(
+    internal_context_t &ctx,
+    OnodeRef &onode,
+    std::string &&name);
+  tm_ret _xattr_clear(
+    internal_context_t &ctx,
+    OnodeRef &onode);
   tm_ret _create_collection(
     internal_context_t &ctx,
     const coll_t& cid, int bits);

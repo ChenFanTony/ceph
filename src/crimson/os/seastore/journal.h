@@ -7,6 +7,7 @@
 
 #include "crimson/os/seastore/ordering_handle.h"
 #include "crimson/os/seastore/seastore_types.h"
+#include "crimson/os/seastore/segment_seq_allocator.h"
 
 namespace crimson::os::seastore {
 
@@ -79,7 +80,8 @@ public:
   using replay_ret = replay_ertr::future<>;
   using delta_handler_t = std::function<
     replay_ret(const record_locator_t&,
-	       const delta_info_t&)>;
+	       const delta_info_t&,
+	       seastar::lowres_system_clock::time_point last_modified)>;
   virtual replay_ret replay(
     delta_handler_t &&delta_handler) = 0;
 

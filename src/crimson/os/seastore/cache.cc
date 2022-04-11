@@ -330,12 +330,6 @@ void Cache::register_metrics()
             {src_label}
           ),
           sm::make_counter(
-            "committed_ool_record_padding_bytes",
-            efforts.ool_record_padding_bytes,
-            sm::description("bytes of ool-record padding from committed transactions"),
-            {src_label}
-          ),
-          sm::make_counter(
             "committed_ool_record_metadata_bytes",
             efforts.ool_record_metadata_bytes,
             sm::description("bytes of ool-record metadata from committed transactions"),
@@ -786,9 +780,8 @@ void Cache::mark_transaction_conflicted(
     auto& ool_stats = t.get_ool_write_stats();
     efforts.fresh_ool_written.increment_stat(ool_stats.extents);
     efforts.num_ool_records += ool_stats.num_records;
-    auto ool_record_bytes = (ool_stats.header_bytes + ool_stats.data_bytes);
+    auto ool_record_bytes = (ool_stats.md_bytes + ool_stats.get_data_bytes());
     efforts.ool_record_bytes += ool_record_bytes;
-    // Note: we only account overhead from committed ool records
 
     if (t.get_src() == Transaction::src_t::CLEANER_TRIM ||
         t.get_src() == Transaction::src_t::CLEANER_RECLAIM) {
@@ -917,7 +910,9 @@ CachedExtentRef Cache::duplicate_for_write(
   return ret;
 }
 
-record_t Cache::prepare_record(Transaction &t)
+record_t Cache::prepare_record(
+  Transaction &t,
+  SegmentProvider *cleaner)
 {
   LOG_PREFIX(Cache::prepare_record);
   SUBTRACET(seastore_t, "enter", t);
@@ -945,6 +940,11 @@ record_t Cache::prepare_record(Transaction &t)
   t.write_set.clear();
 
   record_t record;
+  auto commit_time = seastar::lowres_system_clock::now();
+  record.commit_time = commit_time.time_since_epoch().count();
+  record.commit_type = (t.get_src() == Transaction::src_t::MUTATE)
+			? record_commit_type_t::MODIFY
+			: record_commit_type_t::REWRITE;
 
   // Add new copy of mutated blocks, set_io_wait to block until written
   record.deltas.reserve(t.mutated_block_list.size());
@@ -967,6 +967,7 @@ record_t Cache::prepare_record(Transaction &t)
     i->prepare_write();
     i->set_io_wait();
 
+    i->set_last_modified(commit_time);
     assert(i->get_version() > 0);
     auto final_crc = i->get_crc32c();
     if (i->get_type() == extent_types_t::ROOT) {
@@ -983,6 +984,8 @@ record_t Cache::prepare_record(Transaction &t)
 	  0,
 	  0,
 	  t.root->get_version() - 1,
+	  MAX_SEG_SEQ,
+	  segment_type_t::NULL_SEG,
 	  std::move(delta_bl)
 	});
     } else {
@@ -997,6 +1000,12 @@ record_t Cache::prepare_record(Transaction &t)
 	  final_crc,
 	  (seastore_off_t)i->get_length(),
 	  i->get_version() - 1,
+	  cleaner
+	  ? cleaner->get_seq(i->get_paddr().as_seg_paddr().get_segment_id())
+	  : MAX_SEG_SEQ,
+	  cleaner
+	  ? cleaner->get_type(i->get_paddr().as_seg_paddr().get_segment_id())
+	  : segment_type_t::NULL_SEG,
 	  std::move(delta_bl)
 	});
       i->last_committed_crc = final_crc;
@@ -1053,6 +1062,13 @@ record_t Cache::prepare_record(Transaction &t)
       ceph_assert(0 == "ROOT never gets written as a fresh block");
     }
 
+    if (t.get_src() == Transaction::src_t::MUTATE) {
+      i->set_last_modified(commit_time);
+    } else {
+      assert(t.get_src() >= Transaction::src_t::CLEANER_TRIM);
+      i->set_last_rewritten(commit_time);
+    }
+
     assert(bl.length() == i->get_length());
     record.push_back(extent_t{
 	i->get_type(),
@@ -1061,7 +1077,8 @@ record_t Cache::prepare_record(Transaction &t)
 	: (is_lba_node(i->get_type())
 	  ? i->cast<lba_manager::btree::LBANode>()->get_node_meta().begin
 	  : L_ADDR_NULL),
-	std::move(bl)
+	std::move(bl),
+	i->get_last_modified().time_since_epoch().count()
       });
   }
 
@@ -1100,7 +1117,7 @@ record_t Cache::prepare_record(Transaction &t)
 
   SUBDEBUGT(seastore_t,
       "commit H{} dirty_from={}, {} read, {} fresh with {} invalid, "
-      "{} delta, {} retire, {}(md={}B, data={}B, fill={}) ool-records, "
+      "{} delta, {} retire, {}(md={}B, data={}B) ool-records, "
       "{}B md, {}B data",
       t, (void*)&t.get_handle(),
       get_oldest_dirty_from().value_or(JOURNAL_SEQ_NULL),
@@ -1110,10 +1127,8 @@ record_t Cache::prepare_record(Transaction &t)
       delta_stat,
       retire_stat,
       ool_stats.num_records,
-      ool_stats.header_raw_bytes,
-      ool_stats.data_bytes,
-      ((double)(ool_stats.header_raw_bytes + ool_stats.data_bytes) /
-       (ool_stats.header_bytes + ool_stats.data_bytes)),
+      ool_stats.md_bytes,
+      ool_stats.get_data_bytes(),
       record.size.get_raw_mdlength(),
       record.size.dlength);
   if (trans_src == Transaction::src_t::CLEANER_TRIM ||
@@ -1136,10 +1151,8 @@ record_t Cache::prepare_record(Transaction &t)
 
   ++(efforts.num_trans);
   efforts.num_ool_records += ool_stats.num_records;
-  efforts.ool_record_padding_bytes +=
-    (ool_stats.header_bytes - ool_stats.header_raw_bytes);
-  efforts.ool_record_metadata_bytes += ool_stats.header_raw_bytes;
-  efforts.ool_record_data_bytes += ool_stats.data_bytes;
+  efforts.ool_record_metadata_bytes += ool_stats.md_bytes;
+  efforts.ool_record_data_bytes += ool_stats.get_data_bytes();
   efforts.inline_record_metadata_bytes +=
     (record.size.get_raw_mdlength() - record.get_delta_size());
 
@@ -1173,7 +1186,13 @@ void Cache::complete_commit(
       if (cleaner) {
 	cleaner->mark_space_used(
 	  i->get_paddr(),
-	  i->get_length());
+	  i->get_length(),
+	  (t.get_src() == Transaction::src_t::MUTATE)
+	    ? i->last_modified
+	    : seastar::lowres_system_clock::time_point(),
+	  (t.get_src() >= Transaction::src_t::CLEANER_TRIM)
+	    ? i->last_rewritten
+	    : seastar::lowres_system_clock::time_point());
       }
     }
   });
@@ -1274,7 +1293,8 @@ Cache::replay_delta_ret
 Cache::replay_delta(
   journal_seq_t journal_seq,
   paddr_t record_base,
-  const delta_info_t &delta)
+  const delta_info_t &delta,
+  seastar::lowres_system_clock::time_point& last_modified)
 {
   LOG_PREFIX(Cache::replay_delta);
   if (delta.type == extent_types_t::ROOT) {
@@ -1286,6 +1306,7 @@ Cache::replay_delta(
     root->state = CachedExtent::extent_state_t::DIRTY;
     DEBUG("replayed root delta at {} {}, add extent -- {}, root={}",
           journal_seq, record_base, delta, *root);
+    root->set_last_modified(last_modified);
     add_extent(root);
     return replay_delta_ertr::now();
   } else {
@@ -1329,13 +1350,14 @@ Cache::replay_delta(
 	return;
       }
 
-      TRACE("replay extent delta at {} {} ... -- {}, prv_extent={}",
+      DEBUG("replay extent delta at {} {} ... -- {}, prv_extent={}",
             journal_seq, record_base, delta, *extent);
 
       assert(extent->version == delta.pversion);
 
       assert(extent->last_committed_crc == delta.prev_crc);
       extent->apply_delta_and_adjust_crc(record_base, delta.bl);
+      extent->set_last_modified(last_modified);
       assert(extent->last_committed_crc == delta.final_crc);
 
       extent->version++;
@@ -1371,9 +1393,12 @@ Cache::get_next_dirty_extents_ret Cache::get_next_dirty_extents(
        i != dirty.end() && bytes_so_far < max_bytes;
        ++i) {
     auto dirty_from = i->get_dirty_from();
-    ceph_assert(dirty_from != JOURNAL_SEQ_NULL &&
+    if (unlikely(!(dirty_from != JOURNAL_SEQ_NULL &&
                 dirty_from != JOURNAL_SEQ_MAX &&
-                dirty_from != NO_DELTAS);
+                dirty_from != NO_DELTAS))) {
+      ERRORT("{}", t, *i);
+      ceph_abort();
+    }
     if (dirty_from < seq) {
       TRACET("next extent -- {}", t, *i);
       if (!cand.empty() && cand.back()->get_dirty_from() > dirty_from) {

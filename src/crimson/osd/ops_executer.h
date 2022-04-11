@@ -41,6 +41,8 @@ class OpsExecuter : public seastar::enable_lw_shared_from_this<OpsExecuter> {
     crimson::stateful_ec,
     crimson::ct_error::enoent,
     crimson::ct_error::invarg,
+    crimson::ct_error::erange,
+    crimson::ct_error::ecanceled,
     crimson::ct_error::permission_denied,
     crimson::ct_error::operation_not_supported,
     crimson::ct_error::input_output_error,
@@ -205,6 +207,9 @@ private:
   watch_ierrorator::future<> do_op_notify_ack(
     OSDOp& osd_op,
     const ObjectState& os);
+  call_errorator::future<> do_assert_ver(
+    OSDOp& osd_op,
+    const ObjectState& os);
 
   template <class Func>
   auto do_const_op(Func&& f);
@@ -222,6 +227,9 @@ private:
   decltype(auto) dont_do_legacy_op() {
     return crimson::ct_error::operation_not_supported::make();
   }
+
+  interruptible_errorated_future<osd_op_errorator>
+  do_execute_op(OSDOp& osd_op);
 
 public:
   template <class MsgT>
