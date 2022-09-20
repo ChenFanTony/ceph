@@ -25,10 +25,10 @@ using namespace crimson::os::seastore::lba_manager;
 using namespace crimson::os::seastore::lba_manager::btree;
 
 struct btree_test_base :
-  public seastar_test_suite_t, SegmentProvider {
+  public seastar_test_suite_t, SegmentProvider, JournalTrimmer {
 
   segment_manager::EphemeralSegmentManagerRef segment_manager;
-  ExtentReaderRef scanner;
+  SegmentManagerGroupRef sms;
   JournalRef journal;
   ExtentPlacementManagerRef epm;
   CacheRef cache;
@@ -39,52 +39,65 @@ struct btree_test_base :
 
   segment_id_t next;
 
-  btree_test_base() = default;
-
   std::map<segment_id_t, segment_seq_t> segment_seqs;
   std::map<segment_id_t, segment_type_t> segment_types;
 
+  journal_seq_t dummy_tail;
 
-  seastar::lowres_system_clock::time_point get_last_modified(
-    segment_id_t id) const final {
-    return seastar::lowres_system_clock::time_point();
+  mutable segment_info_t tmp_info;
+
+  btree_test_base() = default;
+
+  /*
+   * JournalTrimmer interfaces
+   */
+  journal_seq_t get_journal_head() const final { return dummy_tail; }
+
+  void set_journal_head(journal_seq_t) final {}
+
+  journal_seq_t get_dirty_tail() const final { return dummy_tail; }
+
+  journal_seq_t get_alloc_tail() const final { return dummy_tail; }
+
+  void update_journal_tails(journal_seq_t, journal_seq_t) final {}
+
+  /*
+   * SegmentProvider interfaces
+   */
+  const segment_info_t& get_seg_info(segment_id_t id) const final {
+    tmp_info = {};
+    tmp_info.seq = segment_seqs.at(id);
+    tmp_info.type = segment_types.at(id);
+    return tmp_info;
   }
 
-  seastar::lowres_system_clock::time_point get_last_rewritten(
-    segment_id_t id) const final {
-    return seastar::lowres_system_clock::time_point();
-  }
-  void update_segment_avail_bytes(paddr_t offset) final {}
-
-  segment_id_t get_segment(
-    device_id_t id,
+  segment_id_t allocate_segment(
     segment_seq_t seq,
-    segment_type_t type) final
-  {
+    segment_type_t type,
+    data_category_t,
+    reclaim_gen_t
+  ) final {
     auto ret = next;
     next = segment_id_t{
-      next.device_id(),
+      segment_manager->get_device_id(),
       next.device_segment_id() + 1};
     segment_seqs[ret] = seq;
     segment_types[ret] = type;
     return ret;
   }
 
-  segment_seq_t get_seq(segment_id_t id) {
-    return segment_seqs[id];
-  }
+  void close_segment(segment_id_t) final {}
 
-  segment_type_t get_type(segment_id_t id) {
-    return segment_types[id];
-  }
+  void update_segment_avail_bytes(segment_type_t, paddr_t) final {}
 
-  journal_seq_t get_journal_tail_target() const final { return journal_seq_t{}; }
-  void update_journal_tail_committed(journal_seq_t committed) final {}
+  void update_modify_time(segment_id_t, sea_time_point, std::size_t) final {}
+
+  SegmentManagerGroup* get_segment_manager_group() final { return sms.get(); }
 
   virtual void complete_commit(Transaction &t) {}
   seastar::future<> submit_transaction(TransactionRef t)
   {
-    auto record = cache->prepare_record(*t, this);
+    auto record = cache->prepare_record(*t, JOURNAL_SEQ_NULL, JOURNAL_SEQ_NULL);
     return journal->submit_record(std::move(record), t->get_handle()).safe_then(
       [this, t=std::move(t)](auto submit_result) mutable {
 	cache->complete_commit(
@@ -98,23 +111,27 @@ struct btree_test_base :
   virtual LBAManager::mkfs_ret test_structure_setup(Transaction &t) = 0;
   seastar::future<> set_up_fut() final {
     segment_manager = segment_manager::create_test_ephemeral();
-    scanner.reset(new ExtentReader());
-    auto& scanner_ref = *scanner.get();
-    journal = journal::make_segmented(
-      *segment_manager, scanner_ref, *this);
-    epm.reset(new ExtentPlacementManager());
-    cache.reset(new Cache(scanner_ref, *epm));
-
-    block_size = segment_manager->get_block_size();
-    next = segment_id_t{segment_manager->get_device_id(), 0};
-    scanner_ref.add_segment_manager(segment_manager.get());
-    journal->set_write_pipeline(&pipeline);
-
     return segment_manager->init(
     ).safe_then([this] {
-      return journal->open_for_write().discard_result();
+      return segment_manager->mkfs(
+        segment_manager::get_ephemeral_device_config(0, 1));
     }).safe_then([this] {
-      return epm->open();
+      sms.reset(new SegmentManagerGroup());
+      journal = journal::make_segmented(*this, *this);
+      epm.reset(new ExtentPlacementManager());
+      cache.reset(new Cache(*epm));
+
+      block_size = segment_manager->get_block_size();
+      next = segment_id_t{segment_manager->get_device_id(), 0};
+      sms->add_segment_manager(segment_manager.get());
+      epm->test_init_no_background(segment_manager.get());
+      journal->set_write_pipeline(&pipeline);
+
+      return journal->open_for_mkfs().discard_result();
+    }).safe_then([this] {
+      dummy_tail = journal_seq_t{0,
+        paddr_t::make_seg_paddr(segment_id_t(segment_manager->get_device_id(), 0), 0)};
+      return epm->open_for_write();
     }).safe_then([this] {
       return seastar::do_with(
 	cache->create_transaction(
@@ -147,7 +164,7 @@ struct btree_test_base :
     }).safe_then([this] {
       test_structure_reset();
       segment_manager.reset();
-      scanner.reset();
+      sms.reset();
       journal.reset();
       epm.reset();
       cache.reset();
@@ -241,7 +258,7 @@ struct lba_btree_test : btree_test_base {
   void insert(laddr_t addr, extent_len_t len) {
     ceph_assert(check.count(addr) == 0);
     check.emplace(addr, get_map_val(len));
-    lba_btree_update([=](auto &btree, auto &t) {
+    lba_btree_update([=, this](auto &btree, auto &t) {
       return btree.insert(
 	get_op_context(t), addr, get_map_val(len)
       ).si_then([](auto){});
@@ -253,7 +270,7 @@ struct lba_btree_test : btree_test_base {
     ceph_assert(iter != check.end());
     auto len = iter->second.len;
     check.erase(iter++);
-    lba_btree_update([=](auto &btree, auto &t) {
+    lba_btree_update([=, this](auto &btree, auto &t) {
       return btree.lower_bound(
 	get_op_context(t), addr
       ).si_then([this, len, addr, &btree, &t](auto iter) {
@@ -269,7 +286,7 @@ struct lba_btree_test : btree_test_base {
 
   void check_lower_bound(laddr_t addr) {
     auto iter = check.lower_bound(addr);
-    auto result = lba_btree_read([=](auto &btree, auto &t) {
+    auto result = lba_btree_read([=, this](auto &btree, auto &t) {
       return btree.lower_bound(
 	get_op_context(t), addr
       ).si_then([](auto iter)
@@ -315,11 +332,25 @@ struct btree_lba_manager_test : btree_test_base {
   btree_lba_manager_test() = default;
 
   void complete_commit(Transaction &t) final {
-    lba_manager->complete_transaction(t);
+    std::vector<CachedExtentRef> lba_to_clear;
+    lba_to_clear.reserve(t.get_retired_set().size());
+    for (auto &e: t.get_retired_set()) {
+      if (e->is_logical() || is_lba_node(e->get_type()))
+	lba_to_clear.push_back(e);
+    }
+    std::vector<CachedExtentRef> lba_to_link;
+    lba_to_link.reserve(t.get_fresh_block_stats().num);
+    t.for_each_fresh_block([&](auto &e) {
+      if (e->is_valid() &&
+	  (is_lba_node(e->get_type()) || e->is_logical()))
+	  lba_to_link.push_back(e);
+    });
+
+    lba_manager->complete_transaction(t, lba_to_clear, lba_to_link);
   }
 
   LBAManager::mkfs_ret test_structure_setup(Transaction &t) final {
-    lba_manager.reset(new BtreeLBAManager(*segment_manager, *cache));
+    lba_manager.reset(new BtreeLBAManager(*cache));
     return lba_manager->mkfs(t);
   }
 
@@ -346,7 +377,11 @@ struct btree_lba_manager_test : btree_test_base {
       test_lba_mappings
     };
     if (create_fake_extent) {
-      cache->alloc_new_extent<TestBlockPhysical>(*t.t, TestBlockPhysical::SIZE);
+      cache->alloc_new_extent<TestBlockPhysical>(
+          *t.t,
+          TestBlockPhysical::SIZE,
+          placement_hint_t::HOT,
+          0);
     };
     return t;
   }
@@ -393,7 +428,7 @@ struct btree_lba_manager_test : btree_test_base {
     paddr_t paddr) {
     auto ret = with_trans_intr(
       *t.t,
-      [=](auto &t) {
+      [=, this](auto &t) {
 	return lba_manager->alloc_extent(t, hint, len, paddr);
       }).unsafe_get0();
     logger().debug("alloc'd: {}", *ret);
@@ -404,7 +439,7 @@ struct btree_lba_manager_test : btree_test_base {
       std::make_pair(
 	ret->get_key(),
 	test_extent_t{
-	  ret->get_paddr(),
+	  ret->get_val(),
 	  ret->get_length(),
 	  1
         }
@@ -427,7 +462,7 @@ struct btree_lba_manager_test : btree_test_base {
 
     auto refcnt = with_trans_intr(
       *t.t,
-      [=](auto &t) {
+      [=, this](auto &t) {
 	return lba_manager->decref_extent(
 	  t,
 	  target->first);
@@ -451,7 +486,7 @@ struct btree_lba_manager_test : btree_test_base {
     target->second.refcount++;
     auto refcnt = with_trans_intr(
       *t.t,
-      [=](auto &t) {
+      [=, this](auto &t) {
 	return lba_manager->incref_extent(
 	  t,
 	  target->first);
@@ -489,29 +524,29 @@ struct btree_lba_manager_test : btree_test_base {
 
       auto ret_list = with_trans_intr(
 	*t.t,
-	[=](auto &t) {
+	[=, this](auto &t) {
 	  return lba_manager->get_mappings(
 	    t, laddr, len);
 	}).unsafe_get0();
       EXPECT_EQ(ret_list.size(), 1);
       auto &ret = *ret_list.begin();
-      EXPECT_EQ(i.second.addr, ret->get_paddr());
+      EXPECT_EQ(i.second.addr, ret->get_val());
       EXPECT_EQ(laddr, ret->get_key());
       EXPECT_EQ(len, ret->get_length());
 
       auto ret_pin = with_trans_intr(
 	*t.t,
-	[=](auto &t) {
+	[=, this](auto &t) {
 	  return lba_manager->get_mapping(
 	    t, laddr);
 	}).unsafe_get0();
-      EXPECT_EQ(i.second.addr, ret_pin->get_paddr());
+      EXPECT_EQ(i.second.addr, ret_pin->get_val());
       EXPECT_EQ(laddr, ret_pin->get_key());
       EXPECT_EQ(len, ret_pin->get_length());
     }
     with_trans_intr(
       *t.t,
-      [=, &t](auto &) {
+      [=, &t, this](auto &) {
 	return lba_manager->scan_mappings(
 	  *t.t,
 	  0,

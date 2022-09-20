@@ -268,6 +268,7 @@ Server::Server(MDSRank *m, MetricsHandler *metrics_handler) :
   dir_max_entries = g_conf().get_val<uint64_t>("mds_dir_max_entries");
   bal_fragment_size_max = g_conf().get_val<int64_t>("mds_bal_fragment_size_max");
   supported_features = feature_bitset_t(CEPHFS_FEATURES_MDS_SUPPORTED);
+  supported_metric_spec = feature_bitset_t(CEPHFS_METRIC_FEATURES_ALL);
 }
 
 void Server::dispatch(const cref_t<Message> &m)
@@ -585,7 +586,23 @@ void Server::handle_client_session(const cref_t<MClientSession> &m)
 	session->is_stale() ||
 	session->is_killing() ||
 	terminating_sessions) {
-      dout(10) << "currently open|opening|stale|killing, dropping this req" << dendl;
+      if (m->supported_features.test(CEPHFS_FEATURE_NOTIFY_SESSION_STATE)) {
+	if (session->is_open() && !mds->is_stopping()) {
+          dout(10) << "currently already opened" << dendl;
+
+          auto reply = make_message<MClientSession>(CEPH_SESSION_OPEN,
+                                                    session->get_push_seq());
+          if (session->info.has_feature(CEPHFS_FEATURE_MIMIC))
+            reply->supported_features = supported_features;
+          mds->send_message_client(reply, session);
+          if (mdcache->is_readonly()) {
+            auto m = make_message<MClientSession>(CEPH_SESSION_FORCE_RO);
+            mds->send_message_client(m, session);
+          }
+	}
+      }
+      dout(10) << "currently " << session->get_state_name()
+               << ", dropping this req" << dendl;
       return;
     }
     ceph_assert(session->is_closed() || session->is_closing());
@@ -859,8 +876,10 @@ void Server::_session_logged(Session *session, uint64_t state_seq, bool open, ve
     metrics_handler->add_session(session);
     ceph_assert(session->get_connection());
     auto reply = make_message<MClientSession>(CEPH_SESSION_OPEN);
-    if (session->info.has_feature(CEPHFS_FEATURE_MIMIC))
+    if (session->info.has_feature(CEPHFS_FEATURE_MIMIC)) {
       reply->supported_features = supported_features;
+      reply->metric_spec = supported_metric_spec;
+    }
     mds->send_message_client(reply, session);
     if (mdcache->is_readonly()) {
       auto m = make_message<MClientSession>(CEPH_SESSION_FORCE_RO);
@@ -1013,8 +1032,10 @@ void Server::finish_force_open_sessions(const map<client_t,pair<Session*,uint64_
         metrics_handler->add_session(session);
 
 	auto reply = make_message<MClientSession>(CEPH_SESSION_OPEN);
-	if (session->info.has_feature(CEPHFS_FEATURE_MIMIC))
+	if (session->info.has_feature(CEPHFS_FEATURE_MIMIC)) {
 	  reply->supported_features = supported_features;
+          reply->metric_spec = supported_metric_spec;
+	}
 	mds->send_message_client(reply, session);
 
 	if (mdcache->is_readonly())
@@ -1156,7 +1177,7 @@ void Server::find_idle_sessions()
       if (mds->locker->revoke_stale_caps(session)) {
 	mds->locker->remove_stale_leases(session);
 	finish_flush_session(session, session->get_push_seq());
-	auto m = make_message<MClientSession>(CEPH_SESSION_STALE, session->get_push_seq());
+	auto m = make_message<MClientSession>(CEPH_SESSION_STALE);
 	mds->send_message_client(m, session);
       } else {
 	to_evict.push_back(session);
@@ -1306,38 +1327,23 @@ void Server::kill_session(Session *session, Context *on_safe)
   }
 }
 
-size_t Server::apply_blocklist(const std::set<entity_addr_t> &blocklist)
+size_t Server::apply_blocklist()
 {
-  bool prenautilus = mds->objecter->with_osdmap(
-      [&](const OSDMap& o) {
-	return o.require_osd_release < ceph_release_t::nautilus;
-      });
-
   std::vector<Session*> victims;
   const auto& sessions = mds->sessionmap.get_sessions();
-  for (const auto& p : sessions) {
-    if (!p.first.is_client()) {
-      // Do not apply OSDMap blocklist to MDS daemons, we find out
-      // about their death via MDSMap.
-      continue;
-    }
-
-    Session *s = p.second;
-    auto inst_addr = s->info.inst.addr;
-    // blocklist entries are always TYPE_ANY for nautilus+
-    inst_addr.set_type(entity_addr_t::TYPE_ANY);
-    if (blocklist.count(inst_addr)) {
-      victims.push_back(s);
-      continue;
-    }
-    if (prenautilus) {
-      // ...except pre-nautilus, they were TYPE_LEGACY
-      inst_addr.set_type(entity_addr_t::TYPE_LEGACY);
-      if (blocklist.count(inst_addr)) {
-	victims.push_back(s);
+  mds->objecter->with_osdmap(
+    [&](const OSDMap& o) {
+      for (const auto& p : sessions) {
+	if (!p.first.is_client()) {
+	  // Do not apply OSDMap blocklist to MDS daemons, we find out
+	  // about their death via MDSMap.
+	  continue;
+	}
+	if (o.is_blocklisted(p.second->info.inst.addr)) {
+	  victims.push_back(p.second);
+	}
       }
-    }
-  }
+    });
 
   for (const auto& s : victims) {
     kill_session(s, nullptr);
@@ -1499,8 +1505,10 @@ void Server::handle_client_reconnect(const cref_t<MClientReconnect> &m)
     metrics_handler->add_session(session);
     // notify client of success with an OPEN
     auto reply = make_message<MClientSession>(CEPH_SESSION_OPEN);
-    if (session->info.has_feature(CEPHFS_FEATURE_MIMIC))
+    if (session->info.has_feature(CEPHFS_FEATURE_MIMIC)) {
       reply->supported_features = supported_features;
+      reply->metric_spec = supported_metric_spec;
+    }
     mds->send_message_client(reply, session);
     mds->clog->debug() << "reconnect by " << session->info.inst << " after " << delay;
   }
@@ -2141,6 +2149,9 @@ void Server::early_reply(MDRequestRef& mdr, CInode *tracei, CDentry *tracedn)
   mds->logger->inc(l_mds_reply);
   utime_t lat = ceph_clock_now() - req->get_recv_stamp();
   mds->logger->tinc(l_mds_reply_latency, lat);
+  if (lat >= g_conf()->mds_op_complaint_time) {
+    mds->logger->inc(l_mds_slow_reply);
+  }
   if (client_inst.name.is_client()) {
     mds->sessionmap.hit_session(mdr->session);
   }
@@ -2199,6 +2210,9 @@ void Server::reply_client_request(MDRequestRef& mdr, const ref_t<MClientReply> &
     mds->logger->inc(l_mds_reply);
     utime_t lat = ceph_clock_now() - mdr->client_request->get_recv_stamp();
     mds->logger->tinc(l_mds_reply_latency, lat);
+    if (lat >= g_conf()->mds_op_complaint_time) {
+      mds->logger->inc(l_mds_slow_reply);
+    }
     if (session && client_inst.name.is_client()) {
       mds->sessionmap.hit_session(session);
     }
@@ -2318,20 +2332,7 @@ void Server::set_trace_dist(const ref_t<MClientReply> &reply,
     dout(20) << "set_trace_dist added dir  " << *dir << dendl;
 
     encode(dn->get_name(), bl);
-
-    int lease_mask = 0;
-    CDentry::linkage_t *dnl = dn->get_linkage(mdr->get_client(), mdr);
-    if (dnl->is_primary()) {
-      ceph_assert(dnl->get_inode() == in);
-      lease_mask = CEPH_LEASE_PRIMARY_LINK;
-    } else {
-      if (dnl->is_remote())
-	ceph_assert(dnl->get_remote_ino() == in->ino());
-      else
-	ceph_assert(!in);
-    }
-    mds->locker->issue_client_lease(dn, mdr, lease_mask, now, bl);
-    dout(20) << "set_trace_dist added dn   " << snapid << " " << *dn << dendl;
+    mds->locker->issue_client_lease(dn, in, mdr, now, bl);
   } else
     reply->head.is_dentry = 0;
 
@@ -2702,7 +2703,7 @@ void Server::handle_peer_request(const cref_t<MMDSPeerRequest> &m)
 
   CDentry *straydn = NULL;
   if (m->straybl.length() > 0) {
-    mdcache->decode_replica_stray(straydn, m->straybl, from);
+    mdcache->decode_replica_stray(straydn, nullptr, m->straybl, from);
     ceph_assert(straydn);
     m->straybl.clear();
   }
@@ -3358,18 +3359,20 @@ CInode* Server::prepare_new_inode(MDRequestRef& mdr, CDir *dir, inodeno_t useino
   _inode->truncate_seq = 1; /* starting with 1, 0 is kept for no-truncation logic */
 
   CInode *diri = dir->get_inode();
+  auto pip = diri->get_projected_inode();
 
-  dout(10) << oct << " dir mode 0" << diri->get_inode()->mode << " new mode 0" << mode << dec << dendl;
+  dout(10) << oct << " dir mode 0" << pip->mode << " new mode 0" << mode << dec << dendl;
 
-  if (diri->get_inode()->mode & S_ISGID) {
+  if (pip->mode & S_ISGID) {
     dout(10) << " dir is sticky" << dendl;
-    _inode->gid = diri->get_inode()->gid;
+    _inode->gid = pip->gid;
     if (S_ISDIR(mode)) {
-      dout(10) << " new dir also sticky" << dendl;      
+      dout(10) << " new dir also sticky" << dendl;
       _inode->mode |= S_ISGID;
     }
-  } else 
+  } else {
     _inode->gid = mdr->client_request->get_caller_gid();
+  }
 
   _inode->uid = mdr->client_request->get_caller_uid();
 
@@ -3440,15 +3443,68 @@ void Server::apply_allocated_inos(MDRequestRef& mdr, Session *session)
   }
 }
 
+struct C_MDS_TryOpenInode : public ServerContext {
+  MDRequestRef mdr;
+  inodeno_t ino;
+  C_MDS_TryOpenInode(Server *s, MDRequestRef& r, inodeno_t i) :
+    ServerContext(s), mdr(r), ino(i) {}
+  void finish(int r) override {
+    server->_try_open_ino(mdr, r, ino);
+  }
+};
+
+void Server::_try_open_ino(MDRequestRef& mdr, int r, inodeno_t ino)
+{
+  dout(10) << "_try_open_ino " << mdr.get() << " ino " << ino << " r=" << r << dendl;
+
+  // `r` is a rank if >=0, else an error code
+  if (r >= 0) {
+    mds_rank_t dest_rank(r);
+    if (dest_rank == mds->get_nodeid())
+      dispatch_client_request(mdr);
+    else
+      mdcache->request_forward(mdr, dest_rank);
+    return;
+  }
+
+  // give up
+  if (r == -CEPHFS_ENOENT || r == -CEPHFS_ENODATA)
+    r = -CEPHFS_ESTALE;
+  respond_to_request(mdr, r);
+}
+
 class C_MDS_TryFindInode : public ServerContext {
   MDRequestRef mdr;
+  MDCache *mdcache;
+  inodeno_t ino;
 public:
-  C_MDS_TryFindInode(Server *s, MDRequestRef& r) : ServerContext(s), mdr(r) {}
+  C_MDS_TryFindInode(Server *s, MDRequestRef& r, MDCache *m, inodeno_t i) :
+    ServerContext(s), mdr(r), mdcache(m), ino(i) {}
   void finish(int r) override {
-    if (r == -CEPHFS_ESTALE) // :( find_ino_peers failed
-      server->respond_to_request(mdr, r);
-    else
+    if (r == -CEPHFS_ESTALE) { // :( find_ino_peers failed
+      /*
+       * There has one case that when the MDS crashes and the
+       * openfiletable journal couldn't be flushed and then
+       * the replacing MDS is possibly won't load some already
+       * opened CInodes into the MDCache. And if the clients
+       * will retry some requests after reconnected, the MDS
+       * will return -ESTALE after failing to find the ino in
+       * all active peers.
+       *
+       * As a workaround users can run `ls -R ${mountpoint}`
+       * to list all the sub-files or sub-direcotries from the
+       * mountpoint.
+       *
+       * We need try to open the ino and try it again.
+       */
+      CInode *in = mdcache->get_inode(ino);
+      if (in && in->state_test(CInode::STATE_PURGING))
+        server->respond_to_request(mdr, r);
+      else
+        mdcache->open_ino(ino, (int64_t)-1, new C_MDS_TryOpenInode(server, mdr, ino));
+    } else {
       server->dispatch_client_request(mdr);
+    }
   }
 };
 
@@ -3488,8 +3544,8 @@ CInode* Server::rdlock_path_pin_ref(MDRequestRef& mdr,
       respond_to_request(mdr, r);
     } else if (r == -CEPHFS_ESTALE) {
       dout(10) << "FAIL on CEPHFS_ESTALE but attempting recovery" << dendl;
-      MDSContext *c = new C_MDS_TryFindInode(this, mdr);
-      mdcache->find_ino_peers(refpath.get_ino(), c);
+      inodeno_t ino = refpath.get_ino();
+      mdcache->find_ino_peers(ino, new C_MDS_TryFindInode(this, mdr, mdcache, ino));
     } else {
       dout(10) << "FAIL on error " << r << dendl;
       respond_to_request(mdr, r);
@@ -3574,7 +3630,8 @@ CDentry* Server::rdlock_path_xlock_dentry(MDRequestRef& mdr,
   if (r < 0) {
     if (r == -CEPHFS_ESTALE) {
       dout(10) << "FAIL on CEPHFS_ESTALE but attempting recovery" << dendl;
-      mdcache->find_ino_peers(refpath.get_ino(), new C_MDS_TryFindInode(this, mdr));
+      inodeno_t ino = refpath.get_ino();
+      mdcache->find_ino_peers(ino, new C_MDS_TryFindInode(this, mdr, mdcache, ino));
       return nullptr;
     }
     respond_to_request(mdr, r);
@@ -3659,7 +3716,8 @@ Server::rdlock_two_paths_xlock_destdn(MDRequestRef& mdr, bool xlock_srcdn)
   if (r != 0) {
     if (r == -CEPHFS_ESTALE) {
       dout(10) << "CEPHFS_ESTALE on path, attempting recovery" << dendl;
-      mdcache->find_ino_peers(refpath.get_ino(), new C_MDS_TryFindInode(this, mdr));
+      inodeno_t ino = refpath.get_ino();
+      mdcache->find_ino_peers(ino, new C_MDS_TryFindInode(this, mdr, mdcache, ino));
     } else if (r < 0) {
       respond_to_request(mdr, r);
     }
@@ -3671,7 +3729,8 @@ Server::rdlock_two_paths_xlock_destdn(MDRequestRef& mdr, bool xlock_srcdn)
   if (r != 0) {
     if (r == -CEPHFS_ESTALE) {
       dout(10) << "CEPHFS_ESTALE on path2, attempting recovery" << dendl;
-      mdcache->find_ino_peers(refpath2.get_ino(), new C_MDS_TryFindInode(this, mdr));
+      inodeno_t ino = refpath2.get_ino();
+      mdcache->find_ino_peers(ino, new C_MDS_TryFindInode(this, mdr, mdcache, ino));
     } else if (r < 0) {
       respond_to_request(mdr, r);
     }
@@ -3879,8 +3938,6 @@ void Server::handle_client_getattr(MDRequestRef& mdr, bool is_lookup)
   if (!ref)
     return;
 
-  mdr->getattr_caps = mask;
-
   /*
    * if client currently holds the EXCL cap on a field, do not rdlock
    * it; client's stat() will result in valid info if _either_ EXCL
@@ -3933,7 +3990,7 @@ void Server::handle_client_getattr(MDRequestRef& mdr, bool is_lookup)
   // value for them.  (currently this matters for xattrs and inline data)
   mdr->getattr_caps = mask;
 
-  mds->balancer->hit_inode(ref, META_POP_IRD, req->get_source().num());
+  mds->balancer->hit_inode(ref, META_POP_IRD);
 
   // reply
   dout(10) << "reply to stat on " << *req << dendl;
@@ -4332,8 +4389,7 @@ void Server::handle_client_open(MDRequestRef& mdr)
   if (cmode & CEPH_FILE_MODE_WR)
     mds->balancer->hit_inode(cur, META_POP_IWR);
   else
-    mds->balancer->hit_inode(cur, META_POP_IRD,
-			     mdr->client_request->get_source().num());
+    mds->balancer->hit_inode(cur, META_POP_IRD);
 
   CDentry *dn = 0;
   if (req->get_dentry_wanted()) {
@@ -4769,8 +4825,7 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
     // dentry
     dout(12) << "including    dn " << *dn << dendl;
     encode(dn->get_name(), dnbl);
-    int lease_mask = dnl->is_primary() ? CEPH_LEASE_PRIMARY_LINK : 0;
-    mds->locker->issue_client_lease(dn, mdr, lease_mask, now, dnbl);
+    mds->locker->issue_client_lease(dn, in, mdr, now, dnbl);
 
     // inode
     dout(12) << "including inode " << *in << dendl;
@@ -4817,7 +4872,7 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
   mdr->reply_extra_bl = dirbl;
 
   // bump popularity.  NOTE: this doesn't quite capture it.
-  mds->balancer->hit_dir(dir, META_POP_READDIR, -1, numfiles);
+  mds->balancer->hit_dir(dir, META_POP_READDIR, numfiles);
   
   // reply
   mdr->tracei = diri;
@@ -5880,7 +5935,7 @@ void Server::handle_set_vxattr(MDRequestRef& mdr, CInode *cur)
       return;
     }
 
-    if (quota.is_enable() && !cur->get_projected_srnode())
+    if (quota.is_enabled() && !cur->get_projected_srnode())
       adjust_realm = true;
 
     if (!xlock_policylock(mdr, cur, false, adjust_realm))
@@ -6964,7 +7019,8 @@ void Server::handle_client_link(MDRequestRef& mdr)
     targeti = mdcache->get_inode(req->get_filepath2().get_ino());
     if (!targeti) {
       dout(10) << "CEPHFS_ESTALE on path2, attempting recovery" << dendl;
-      mdcache->find_ino_peers(req->get_filepath2().get_ino(), new C_MDS_TryFindInode(this, mdr));
+      inodeno_t ino = req->get_filepath2().get_ino();
+      mdcache->find_ino_peers(ino, new C_MDS_TryFindInode(this, mdr, mdcache, ino));
       return;
     }
     mdr->pin(targeti);
@@ -10928,9 +10984,6 @@ void Server::_rmsnap_finish(MDRequestRef& mdr, CInode *diri, snapid_t snapid)
 {
   dout(10) << "_rmsnap_finish " << *mdr << " " << snapid << dendl;
   snapid_t stid = mdr->more()->stid;
-  auto p = mdr->more()->snapidbl.cbegin();
-  snapid_t seq;
-  decode(seq, p);  
 
   mdr->apply();
 

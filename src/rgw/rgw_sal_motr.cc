@@ -449,6 +449,12 @@ int MotrUser::remove_user(const DoutPrefixProvider* dpp, optional_yield y)
   return 0;
 }
 
+int MotrUser::verify_mfa(const std::string& mfa_str, bool* verified, const DoutPrefixProvider *dpp, optional_yield y)
+{
+  *verified = false;
+  return 0;
+}
+
 int MotrBucket::remove_bucket(const DoutPrefixProvider *dpp, bool delete_children, bool forward_to_master, req_info* req_info, optional_yield y)
 {
   int ret;
@@ -554,7 +560,8 @@ int MotrBucket::unlink_user(const DoutPrefixProvider* dpp, User* new_user, optio
 }
 
 /* stats - Not for first pass */
-int MotrBucket::read_stats(const DoutPrefixProvider *dpp, int shard_id,
+int MotrBucket::read_stats(const DoutPrefixProvider *dpp,
+    const bucket_index_layout_generation& idx_layout, int shard_id,
     std::string *bucket_ver, std::string *master_ver,
     std::map<RGWObjCategory, RGWStorageStats>& stats,
     std::string *max_marker, bool *syncstopped)
@@ -590,7 +597,9 @@ int MotrBucket::create_multipart_indices()
 }
 
 
-int MotrBucket::read_stats_async(const DoutPrefixProvider *dpp, int shard_id, RGWGetBucketStats_CB *ctx)
+int MotrBucket::read_stats_async(const DoutPrefixProvider *dpp,
+                                 const bucket_index_layout_generation& idx_layout,
+                                 int shard_id, RGWGetBucketStats_CB *ctx)
 {
   return 0;
 }
@@ -630,7 +639,7 @@ int MotrBucket::check_empty(const DoutPrefixProvider *dpp, optional_yield y)
   return 0;
 }
 
-int MotrBucket::check_quota(const DoutPrefixProvider *dpp, RGWQuotaInfo& user_quota, RGWQuotaInfo& bucket_quota, uint64_t obj_size,
+int MotrBucket::check_quota(const DoutPrefixProvider *dpp, RGWQuota& quota, uint64_t obj_size,
     optional_yield y, bool check_size_only)
 {
   /* Not Handled in the first pass as stats are also needed */
@@ -837,31 +846,68 @@ void MotrStore::finalize(void)
 {
 }
 
-const RGWZoneGroup& MotrZone::get_zonegroup()
+const std::string& MotrZoneGroup::get_endpoint() const
 {
-  return *zonegroup;
+  if (!group.endpoints.empty()) {
+      return group.endpoints.front();
+  } else {
+    // use zonegroup's master zone endpoints
+    auto z = group.zones.find(group.master_zone);
+    if (z != group.zones.end() && !z->second.endpoints.empty()) {
+      return z->second.endpoints.front();
+    }
+  }
+  return empty;
 }
 
-int MotrZone::get_zonegroup(const std::string& id, RGWZoneGroup& zg)
+bool MotrZoneGroup::placement_target_exists(std::string& target) const
 {
-  /* XXX: for now only one zonegroup supported */
-  zg = *zonegroup;
+  return !!group.placement_targets.count(target);
+}
+
+int MotrZoneGroup::get_placement_target_names(std::set<std::string>& names) const
+{
+  for (const auto& target : group.placement_targets) {
+    names.emplace(target.second.name);
+  }
+
   return 0;
 }
 
-const RGWZoneParams& MotrZone::get_params()
+int MotrZoneGroup::get_placement_tier(const rgw_placement_rule& rule,
+				       std::unique_ptr<PlacementTier>* tier)
 {
-  return *zone_params;
+  std::map<std::string, RGWZoneGroupPlacementTarget>::const_iterator titer;
+  titer = group.placement_targets.find(rule.name);
+  if (titer == group.placement_targets.end()) {
+    return -ENOENT;
+  }
+
+  const auto& target_rule = titer->second;
+  std::map<std::string, RGWZoneGroupPlacementTier>::const_iterator ttier;
+  ttier = target_rule.tier_targets.find(rule.storage_class);
+  if (ttier == target_rule.tier_targets.end()) {
+    // not found
+    return -ENOENT;
+  }
+
+  PlacementTier* t;
+  t = new MotrPlacementTier(store, ttier->second);
+  if (!t)
+    return -ENOMEM;
+
+  tier->reset(t);
+  return 0;
 }
 
-const rgw_zone_id& MotrZone::get_id()
+ZoneGroup& MotrZone::get_zonegroup()
 {
-  return cur_zone_id;
+  return zonegroup;
 }
 
-const RGWRealm& MotrZone::get_realm()
+const std::string& MotrZone::get_id()
 {
-  return *realm;
+  return zone_params->get_id();
 }
 
 const std::string& MotrZone::get_name() const
@@ -889,9 +935,9 @@ const std::string& MotrZone::get_current_period_id()
   return current_period->get_id();
 }
 
-std::unique_ptr<LuaScriptManager> MotrStore::get_lua_script_manager()
+std::unique_ptr<LuaManager> MotrStore::get_lua_manager()
 {
-  return std::make_unique<MotrLuaScriptManager>(this);
+  return std::make_unique<MotrLuaManager>(this);
 }
 
 int MotrObject::get_obj_state(const DoutPrefixProvider* dpp, RGWObjState **_state, optional_yield y, bool follow_olh)
@@ -1060,9 +1106,10 @@ int MotrObject::omap_set_val_by_key(const DoutPrefixProvider *dpp, const std::st
   return 0;
 }
 
-MPSerializer* MotrObject::get_serializer(const DoutPrefixProvider *dpp, const std::string& lock_name)
+std::unique_ptr<MPSerializer> MotrObject::get_serializer(const DoutPrefixProvider *dpp,
+                                                         const std::string& lock_name)
 {
-  return new MPMotrSerializer(dpp, store, this, lock_name);
+  return std::make_unique<MPMotrSerializer>(dpp, store, this, lock_name);
 }
 
 int MotrObject::transition(Bucket* bucket,
@@ -1279,7 +1326,7 @@ MotrAtomicWriter::MotrAtomicWriter(const DoutPrefixProvider *dpp,
           const rgw_placement_rule *_ptail_placement_rule,
           uint64_t _olh_epoch,
           const std::string& _unique_tag) :
-        Writer(dpp, y),
+        StoreWriter(dpp, y),
         store(_store),
               owner(_owner),
               ptail_placement_rule(_ptail_placement_rule),
@@ -2703,6 +2750,12 @@ std::unique_ptr<RGWRole> MotrStore::get_role(std::string name,
   return std::unique_ptr<RGWRole>(p);
 }
 
+std::unique_ptr<RGWRole> MotrStore::get_role(const RGWRoleInfo& info)
+{
+  RGWRole* p = nullptr;
+  return std::unique_ptr<RGWRole>(p);
+}
+
 std::unique_ptr<RGWRole> MotrStore::get_role(std::string id)
 {
   RGWRole* p = nullptr;
@@ -2759,6 +2812,16 @@ std::unique_ptr<Writer> MotrStore::get_atomic_writer(const DoutPrefixProvider *d
   return std::make_unique<MotrAtomicWriter>(dpp, y,
                   std::move(_head_obj), this, owner,
                   ptail_placement_rule, olh_epoch, unique_tag);
+}
+
+const std::string& MotrStore::get_compression_type(const rgw_placement_rule& rule)
+{
+      return zone.zone_params->get_compression_type(rule);
+}
+
+bool MotrStore::valid_placement(const rgw_placement_rule& rule)
+{
+  return zone.zone_params->valid_placement(rule);
 }
 
 std::unique_ptr<User> MotrStore::get_user(const rgw_user &u)
@@ -2858,6 +2921,14 @@ int MotrStore::forward_request_to_master(const DoutPrefixProvider *dpp, User* us
   return 0;
 }
 
+int MotrStore::forward_iam_request_to_master(const DoutPrefixProvider *dpp, const RGWAccessKey& key, obj_version* objv,
+					     bufferlist& in_data,
+					     RGWXMLDecoder::XMLParser* parser, req_info& info,
+					     optional_yield y)
+{
+    return 0;
+}
+
 std::string MotrStore::zone_unique_id(uint64_t unique_num)
 {
   return "";
@@ -2866,6 +2937,23 @@ std::string MotrStore::zone_unique_id(uint64_t unique_num)
 std::string MotrStore::zone_unique_trans_id(const uint64_t unique_num)
 {
   return "";
+}
+
+int MotrStore::get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* group)
+{
+  /* XXX: for now only one zonegroup supported */
+  ZoneGroup* zg;
+  zg = new MotrZoneGroup(this, zone.zonegroup.get_group());
+
+  group->reset(zg);
+  return 0;
+}
+
+int MotrStore::list_all_zones(const DoutPrefixProvider* dpp,
+                            std::list<std::string>& zone_ids)
+{
+  zone_ids.push_back(zone.get_id());
+    return 0;
 }
 
 int MotrStore::cluster_stat(RGWClusterStat& stats)
@@ -2883,7 +2971,7 @@ std::unique_ptr<Completions> MotrStore::get_completions(void)
   return 0;
 }
 
-std::unique_ptr<Notification> MotrStore::get_notification(Object* obj, Object* src_obj, struct req_state* s,
+std::unique_ptr<Notification> MotrStore::get_notification(Object* obj, Object* src_obj, req_state* s,
     rgw::notify::EventType event_type, const string* object_name)
 {
   return std::make_unique<MotrNotification>(obj, src_obj, event_type);
@@ -2919,7 +3007,7 @@ void MotrStore::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit,
   return;
 }
 
-void MotrStore::get_quota(RGWQuotaInfo& bucket_quota, RGWQuotaInfo& user_quota)
+void MotrStore::get_quota(RGWQuota& quota)
 {
   // XXX: Not handled for the first pass
   return;
@@ -3394,6 +3482,35 @@ int MotrStore::init_metadata_cache(const DoutPrefixProvider *dpp,
   return 0;
 }
 
+  int MotrLuaManager::get_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, std::string& script)
+  {
+    return -ENOENT;
+  }
+
+  int MotrLuaManager::put_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key, const std::string& script)
+  {
+    return -ENOENT;
+  }
+
+  int MotrLuaManager::del_script(const DoutPrefixProvider* dpp, optional_yield y, const std::string& key)
+  {
+    return -ENOENT;
+  }
+
+  int MotrLuaManager::add_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name)
+  {
+    return -ENOENT;
+  }
+
+  int MotrLuaManager::remove_package(const DoutPrefixProvider* dpp, optional_yield y, const std::string& package_name)
+  {
+    return -ENOENT;
+  }
+
+  int MotrLuaManager::list_packages(const DoutPrefixProvider* dpp, optional_yield y, rgw::lua::packages_t& packages)
+  {
+    return -ENOENT;
+  }
 } // namespace rgw::sal
 
 extern "C" {

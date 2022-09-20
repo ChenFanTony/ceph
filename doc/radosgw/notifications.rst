@@ -38,12 +38,12 @@ Notifications may be sent synchronously, as part of the operation that triggered
 In this mode, the operation is acked only after the notification is sent to the topic's configured endpoint, which means that the
 round trip time of the notification is added to the latency of the operation itself.
 
-.. note:: The original triggering operation will still be considered as successful even if the notification fail with an error, cannot be deliverd or times out
+.. note:: The original triggering operation will still be considered as successful even if the notification fail with an error, cannot be delivered or times out
 
 Notifications may also be sent asynchronously. They will be committed into persistent storage and then asynchronously sent to the topic's configured endpoint.
 In this case, the only latency added to the original operation is of committing the notification to persistent storage.
 
-.. note:: If the notification fail with an error, cannot be deliverd or times out, it will be retried until successfully acked
+.. note:: If the notification fail with an error, cannot be delivered or times out, it will be retried until successfully acked
 
 .. tip:: To minimize the added latency in case of asynchronous notifications, it is recommended to place the "log" pool on fast media
 
@@ -385,7 +385,7 @@ pushed or pulled using the pubsub sync module. For example:
        {
            "eventVersion":"2.1",
            "eventSource":"ceph:s3",
-           "awsRegion":"us-east-1",
+           "awsRegion":"zonegroup1",
            "eventTime":"2019-11-22T13:47:35.124724Z",
            "eventName":"ObjectCreated:Put",
            "userIdentity":{
@@ -406,7 +406,7 @@ pushed or pulled using the pubsub sync module. For example:
                    "ownerIdentity":{
                        "principalId":"tester"
                    },
-                   "arn":"arn:aws:s3:us-east-1::mybucket1",
+                   "arn":"arn:aws:s3:zonegroup1::mybucket1",
                    "id":"503a4c37-85eb-47cd-8681-2817e80b4281.5332.38"
                },
                "object":{

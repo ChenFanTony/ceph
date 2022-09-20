@@ -11,11 +11,12 @@
 #include "include/buffer.h"
 
 #include "crimson/common/errorator.h"
-#include "crimson/os/seastore/segment_manager.h"
+#include "crimson/os/seastore/segment_manager_group.h"
 #include "crimson/os/seastore/segment_seq_allocator.h"
 
 namespace crimson::os::seastore {
   class SegmentProvider;
+  class JournalTrimmer;
 }
 
 namespace crimson::os::seastore::journal {
@@ -30,32 +31,28 @@ class SegmentAllocator {
       crimson::ct_error::input_output_error>;
 
  public:
-  SegmentAllocator(std::string name,
-                   segment_type_t type,
+  SegmentAllocator(JournalTrimmer *trimmer,
+                   data_category_t category,
+                   reclaim_gen_t gen,
                    SegmentProvider &sp,
-                   SegmentManager &sm,
                    SegmentSeqAllocator &ssa);
 
   const std::string& get_name() const {
     return print_name;
   }
 
-  device_id_t get_device_id() const {
-    return segment_manager.get_device_id();
+  SegmentProvider &get_provider() {
+    return segment_provider;
   }
 
   seastore_off_t get_block_size() const {
-    return segment_manager.get_block_size();
+    return sm_group.get_block_size();
   }
 
   extent_len_t get_max_write_length() const {
-    return segment_manager.get_segment_size() -
-           p2align(ceph::encoded_sizeof_bounded<segment_header_t>(),
-                   size_t(segment_manager.get_block_size()));
-  }
-
-  device_segment_id_t get_num_segments() const {
-    return segment_manager.get_num_segments();
+    return sm_group.get_segment_size() -
+           sm_group.get_rounded_header_length() -
+           sm_group.get_rounded_tail_length();
   }
 
   bool can_write() const {
@@ -80,15 +77,17 @@ class SegmentAllocator {
   // returns true iff the current segment has insufficient space
   bool needs_roll(std::size_t length) const {
     assert(can_write());
-    auto write_capacity = current_segment->get_write_capacity()
-      - segment_manager.get_rounded_tail_length();
+    assert(current_segment->get_write_capacity() ==
+           sm_group.get_segment_size());
+    auto write_capacity = current_segment->get_write_capacity() -
+                          sm_group.get_rounded_tail_length();
     return length + written_to > std::size_t(write_capacity);
   }
 
   // open for write and generate the correct print name
   using open_ertr = base_ertr;
   using open_ret = open_ertr::future<journal_seq_t>;
-  open_ret open();
+  open_ret open(bool is_mkfs);
 
   // close the current segment and initialize next one
   using roll_ertr = base_ertr;
@@ -100,13 +99,13 @@ class SegmentAllocator {
   // If rolling/opening, no write is allowed.
   using write_ertr = base_ertr;
   using write_ret = write_ertr::future<write_result_t>;
-  write_ret write(ceph::bufferlist to_write);
+  write_ret write(ceph::bufferlist&& to_write);
 
   using close_ertr = base_ertr;
   close_ertr::future<> close();
 
  private:
-  open_ret do_open();
+  open_ret do_open(bool is_mkfs);
 
   void reset() {
     current_segment.reset();
@@ -115,22 +114,22 @@ class SegmentAllocator {
     current_segment_nonce = 0;
   }
 
-  // FIXME: remove the unnecessary is_rolling
   using close_segment_ertr = base_ertr;
-  close_segment_ertr::future<> close_segment(bool is_rolling);
+  close_segment_ertr::future<> close_segment();
 
-  const std::string name;
   // device id is not available during construction,
   // so generate the print_name later.
   std::string print_name;
   const segment_type_t type; // JOURNAL or OOL
+  const data_category_t category;
+  const reclaim_gen_t gen;
   SegmentProvider &segment_provider;
-  SegmentManager &segment_manager;
+  SegmentManagerGroup &sm_group;
   SegmentRef current_segment;
   seastore_off_t written_to;
   SegmentSeqAllocator &segment_seq_allocator;
   segment_nonce_t current_segment_nonce;
-  //3. journal tail written to both segment_header_t and segment_tail_t
+  JournalTrimmer *trimmer;
 };
 
 /**
@@ -361,7 +360,7 @@ public:
   // open for write, generate the correct print name, and register metrics
   using open_ertr = base_ertr;
   using open_ret = open_ertr::future<journal_seq_t>;
-  open_ret open();
+  open_ret open(bool is_mkfs);
 
   using close_ertr = base_ertr;
   close_ertr::future<> close();

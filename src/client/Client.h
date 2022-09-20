@@ -32,6 +32,7 @@
 #include "include/unordered_set.h"
 #include "include/cephfs/metrics/Types.h"
 #include "mds/mdstypes.h"
+#include "include/cephfs/types.h"
 #include "msg/Dispatcher.h"
 #include "msg/MessageRef.h"
 #include "msg/Messenger.h"
@@ -268,6 +269,7 @@ public:
   public:
     explicit CommandHook(Client *client);
     int call(std::string_view command, const cmdmap_t& cmdmap,
+	     const bufferlist&,
 	     Formatter *f,
 	     std::ostream& errss,
 	     bufferlist& out) override;
@@ -353,7 +355,7 @@ public:
    * If @a cb returns a negative error code, stop and return that.
    */
   int readdir_r_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
-		   unsigned want=0, unsigned flags=AT_NO_ATTR_SYNC,
+		   unsigned want=0, unsigned flags=AT_STATX_DONT_SYNC,
 		   bool getref=false);
 
   struct dirent * readdir(dir_result_t *d);
@@ -897,6 +899,7 @@ public:
   std::unique_ptr<MDSMap> mdsmap;
 
   bool fuse_default_permissions;
+  bool _collect_and_send_global_metrics;
 
 protected:
   /* Flags for check_caps() */
@@ -932,8 +935,9 @@ protected:
   void dump_mds_sessions(Formatter *f, bool cap_dump=false);
 
   int make_request(MetaRequest *req, const UserPerm& perms,
-		   InodeRef *ptarget = 0, bool *pcreated = 0,
-		   mds_rank_t use_mds=-1, bufferlist *pdirbl=0);
+                   InodeRef *ptarget = 0, bool *pcreated = 0,
+                   mds_rank_t use_mds=-1, bufferlist *pdirbl=0,
+                   size_t feature_needed=ULONG_MAX);
   void put_request(MetaRequest *request);
   void unregister_request(MetaRequest *request);
 
@@ -1070,7 +1074,7 @@ protected:
 
   int authenticate();
 
-  Inode* get_quota_root(Inode *in, const UserPerm& perms);
+  Inode* get_quota_root(Inode *in, const UserPerm& perms, quota_max_t type=QUOTA_ANY);
   bool check_quota_condition(Inode *in, const UserPerm& perms,
 			     std::function<bool (const Inode &)> test);
   bool is_quota_files_exceeded(Inode *in, const UserPerm& perms);
@@ -1389,8 +1393,7 @@ private:
   int _flock(Fh *fh, int cmd, uint64_t owner);
   int _lazyio(Fh *fh, int enable);
 
-  int get_or_create(Inode *dir, const char* name,
-		    Dentry **pdn, bool expect_null=false);
+  Dentry *get_or_create(Inode *dir, const char* name);
 
   int xattr_permission(Inode *in, const char *name, unsigned want,
 		       const UserPerm& perms);
@@ -1496,7 +1499,7 @@ private:
   Finisher async_ino_releasor;
   Finisher objecter_finisher;
 
-  utime_t last_cap_renew;
+  ceph::coarse_mono_time last_cap_renew;
 
   CommandHook m_command_hook;
 
@@ -1557,8 +1560,8 @@ private:
   ceph::unordered_map<inodeno_t,SnapRealm*> snap_realms;
   std::map<std::string, std::string> metadata;
 
-  utime_t last_auto_reconnect;
-
+  ceph::coarse_mono_time last_auto_reconnect;
+  std::chrono::seconds caps_release_delay, mount_timeout;
   // trace generation
   std::ofstream traceout;
 

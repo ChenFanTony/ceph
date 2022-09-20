@@ -112,10 +112,10 @@ static int read_upload_status(const DoutPrefixProvider *dpp, rgw::sal::Store *st
 
   auto& pool = status_obj->pool;
   const auto oid = status_obj->oid;
-  auto obj_ctx = rados->svc()->sysobj->init_obj_ctx();
+  auto sysobj = rados->svc()->sysobj;
   bufferlist bl;
 
-  ret = rgw_get_system_obj(obj_ctx, pool, oid, bl, nullptr, nullptr,
+  ret = rgw_get_system_obj(sysobj, pool, oid, bl, nullptr, nullptr,
       null_yield, dpp);
 
   if (ret < 0) {
@@ -151,11 +151,11 @@ static int put_upload_status(const DoutPrefixProvider *dpp, rgw::sal::Store *sto
 
   auto& pool = status_obj->pool;
   const auto oid = status_obj->oid;
-  auto obj_ctx = rados->svc()->sysobj->init_obj_ctx();
+  auto sysobj = rados->svc()->sysobj;
   bufferlist bl;
   status->encode(bl);
 
-  ret = rgw_put_system_obj(dpp, obj_ctx, pool, oid, bl, true, nullptr,
+  ret = rgw_put_system_obj(dpp, sysobj, pool, oid, bl, true, nullptr,
       real_time{}, null_yield);
 
   return ret;
@@ -1104,8 +1104,8 @@ static int cloud_tier_multipart_transfer(RGWLCCloudTierCtx& tier_ctx) {
   }
   dest_obj.init(target_bucket, target_obj_name);
 
-  status_obj = rgw_raw_obj(tier_ctx.store->get_zone()->get_params().log_pool,
-      "lc_multipart_" + tier_ctx.obj->get_oid());
+  rgw_pool pool = static_cast<rgw::sal::RadosStore*>(tier_ctx.store)->svc()->zone->get_zone_params().log_pool;
+  status_obj = rgw_raw_obj(pool, "lc_multipart_" + tier_ctx.obj->get_oid());
 
   ret = read_upload_status(tier_ctx.dpp, tier_ctx.store, &status_obj, &status);
 

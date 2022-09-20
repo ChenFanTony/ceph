@@ -794,6 +794,13 @@ class Module(MgrModule):
                 path,
                 'DF {}'.format(state),
             )
+            path = 'cluster_by_class_{}'.format(state)
+            metrics[path] = Metric(
+                'gauge',
+                path,
+                'DF {}'.format(state),
+                ('device_class',)
+            )
         for state in DF_POOL:
             path = 'pool_{}'.format(state)
             metrics[path] = Metric(
@@ -921,6 +928,8 @@ class Module(MgrModule):
         df = self.get('df')
         for stat in DF_CLUSTER:
             self.metrics['cluster_{}'.format(stat)].set(df['stats'][stat])
+            for device_class in df['stats_by_class']:
+                self.metrics['cluster_by_class_{}'.format(stat)].set(df['stats_by_class'][device_class][stat], (device_class,))
 
         for pool in df['pools']:
             for stat in DF_POOL:
@@ -973,11 +982,11 @@ class Module(MgrModule):
         for mon in mon_status['monmap']['mons']:
             rank = mon['rank']
             id_ = mon['name']
-            host_version = servers.get((id_, 'mon'), ('', '', ''))
+            mon_version = servers.get((id_, 'mon'), ('', '', ''))
             self.metrics['mon_metadata'].set(1, (
-                'mon.{}'.format(id_), host_version[0],
+                'mon.{}'.format(id_), mon_version[0],
                 mon['public_addr'].rsplit(':', 1)[0], rank,
-                host_version[1]
+                mon_version[1]
             ))
             in_quorum = int(rank in mon_status['quorum'])
             self.metrics['mon_quorum_status'].set(in_quorum, (
@@ -1060,10 +1069,10 @@ class Module(MgrModule):
     def get_service_list(self) -> Dict[Tuple[str, str], Tuple[str, str, str]]:
         ret = {}
         for server in self.list_servers():
-            version = cast(str, server.get('ceph_version', ''))
             host = cast(str, server.get('hostname', ''))
             for service in cast(List[ServiceInfoT], server.get('services', [])):
-                ret.update({(service['id'], service['type']): (host, version, service.get('name', ''))})
+                ret.update({(service['id'], service['type']): (
+                    host, service['ceph_version'], service.get('name', ''))})
         return ret
 
     @profile_method()
@@ -1101,7 +1110,7 @@ class Module(MgrModule):
                               "skipping output".format(id_))
                 continue
 
-            host_version = servers.get((str(id_), 'osd'), ('', '', ''))
+            osd_version = servers.get((str(id_), 'osd'), ('', '', ''))
 
             # collect disk occupation metadata
             osd_metadata = self.get_metadata("osd", str(id_))
@@ -1118,10 +1127,10 @@ class Module(MgrModule):
                 c_addr,
                 dev_class,
                 f_iface,
-                host_version[0],
+                osd_version[0],
                 obj_store,
                 p_addr,
-                host_version[1]
+                osd_version[1]
             ))
 
             # collect osd status

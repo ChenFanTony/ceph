@@ -47,14 +47,12 @@
 #include "messages/MOSDAlive.h"
 #include "messages/MPoolOp.h"
 #include "messages/MPoolOpReply.h"
-#include "messages/MOSDPGCreate.h"
 #include "messages/MOSDPGCreate2.h"
 #include "messages/MOSDPGCreated.h"
 #include "messages/MOSDPGTemp.h"
 #include "messages/MOSDPGReadyToMerge.h"
 #include "messages/MMonCommand.h"
 #include "messages/MRemoveSnaps.h"
-#include "messages/MOSDScrub.h"
 #include "messages/MRoute.h"
 #include "messages/MMonGetPurgedSnaps.h"
 #include "messages/MMonGetPurgedSnapsReply.h"
@@ -5042,10 +5040,7 @@ epoch_t OSDMonitor::send_pg_creates(int osd, Connection *con, epoch_t next) cons
     return next;
   ceph_assert(!creating_pgs_by_epoch->second.empty());
 
-  MOSDPGCreate *oldm = nullptr; // for pre-mimic OSD compat
-  MOSDPGCreate2 *m = nullptr;
-
-  bool old = osdmap.require_osd_release < ceph_release_t::nautilus;
+  auto m = make_message<MOSDPGCreate2>(creating_pgs_epoch);
 
   epoch_t last = 0;
   for (auto epoch_pgs = creating_pgs_by_epoch->second.lower_bound(next);
@@ -5060,34 +5055,20 @@ epoch_t OSDMonitor::send_pg_creates(int osd, Connection *con, epoch_t next) cons
       // last_scrub_stamp upon pg creation.
       auto create = creating_pgs.pgs.find(pg.pgid);
       ceph_assert(create != creating_pgs.pgs.end());
-      if (old) {
-	if (!oldm) {
-	  oldm = new MOSDPGCreate(creating_pgs_epoch);
-	}
-	oldm->mkpg.emplace(pg.pgid,
-			   pg_create_t{create->second.create_epoch, pg.pgid, 0});
-	oldm->ctimes.emplace(pg.pgid, create->second.create_stamp);
-      } else {
-	if (!m) {
-	  m = new MOSDPGCreate2(creating_pgs_epoch);
-	}
-	m->pgs.emplace(pg, make_pair(create->second.create_epoch,
-				     create->second.create_stamp));
-	if (create->second.history.epoch_created) {
-	  dout(20) << __func__ << "   " << pg << " " << create->second.history
-		   << " " << create->second.past_intervals << dendl;
-	  m->pg_extra.emplace(pg, make_pair(create->second.history,
-					    create->second.past_intervals));
-	}
+      m->pgs.emplace(pg, make_pair(create->second.create_epoch,
+                             create->second.create_stamp));
+      if (create->second.history.epoch_created) {
+        dout(20) << __func__ << "   " << pg << " " << create->second.history
+      	   << " " << create->second.past_intervals << dendl;
+        m->pg_extra.emplace(pg, make_pair(create->second.history,
+                                    create->second.past_intervals));
       }
       dout(20) << __func__ << " will create " << pg
-	       << " at " << create->second.create_epoch << dendl;
+      	       << " at " << create->second.create_epoch << dendl;
     }
   }
-  if (m) {
-    con->send_message(m);
-  } else if (oldm) {
-    con->send_message(oldm);
+  if (!m->pgs.empty()) {
+    con->send_message2(std::move(m));
   } else {
     dout(20) << __func__ << " osd." << osd << " from " << next
              << " has nothing to send" << dendl;
@@ -5250,6 +5231,16 @@ void OSDMonitor::tick()
     if (p->second < now) {
       dout(10) << "expiring blocklist item " << p->first << " expired " << p->second << " < now " << now << dendl;
       pending_inc.old_blocklist.push_back(p->first);
+      do_propose = true;
+    }
+  }
+  for (auto p = osdmap.range_blocklist.begin();
+       p != osdmap.range_blocklist.end();
+       ++p) {
+    if (p->second < now) {
+      dout(10) << "expiring range_blocklist item " << p->first
+	       << " expired " << p->second << " < now " << now << dendl;
+      pending_inc.old_range_blocklist.push_back(p->first);
       do_propose = true;
     }
   }
@@ -6032,7 +6023,31 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
       f->close_section();
       f->flush(rdata);
     }
-    ss << "listed " << osdmap.blocklist.size() << " entries";
+    if (f)
+      f->open_array_section("range_blocklist");
+
+    for (auto p = osdmap.range_blocklist.begin();
+	 p != osdmap.range_blocklist.end();
+	 ++p) {
+      if (f) {
+	f->open_object_section("entry");
+	f->dump_string("range", p->first.get_legacy_str());
+	f->dump_stream("until") << p->second;
+	f->close_section();
+      } else {
+	stringstream ss;
+	string s;
+	ss << p->first << " " << p->second;
+	getline(ss, s);
+	s += "\n";
+	rdata.append(s);
+      }
+    }
+    if (f) {
+      f->close_section();
+      f->flush(rdata);
+    }
+    ss << "listed " << osdmap.blocklist.size() + osdmap.range_blocklist.size() << " entries";
 
   } else if (prefix == "osd pool ls") {
     string detail;
@@ -12565,6 +12580,14 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       return false;
     }
 
+    // make sure kvmon is writeable.
+    if (!mon.kvmon()->is_writeable()) {
+      dout(10) << __func__ << " waiting for kv mon to be writeable for "
+               << "osd new" << dendl;
+      mon.kvmon()->wait_for_writeable(op, new C_RetryMessage(this, op));
+      return false;
+    }
+
     map<string,string> param_map;
 
     bufferlist bl = m->get_data();
@@ -12675,9 +12698,13 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 	     prefix == "osd blacklist clear") {
     pending_inc.new_blocklist.clear();
     std::list<std::pair<entity_addr_t,utime_t > > blocklist;
-    osdmap.get_blocklist(&blocklist);
+    std::list<std::pair<entity_addr_t,utime_t > > range_b;
+    osdmap.get_blocklist(&blocklist, &range_b);
     for (const auto &entry : blocklist) {
       pending_inc.old_blocklist.push_back(entry.first);
+    }
+    for (const auto &entry : range_b) {
+      pending_inc.old_range_blocklist.push_back(entry.first);
     }
     ss << " removed all blocklist entries";
     getline(ss, rs);
@@ -12686,8 +12713,18 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     return true;
   } else if (prefix == "osd blocklist" ||
 	     prefix == "osd blacklist") {
-    string addrstr;
+    string addrstr, rangestr;
+    bool range = false;
     cmd_getval(cmdmap, "addr", addrstr);
+    if (cmd_getval(cmdmap, "range", rangestr)) {
+      if (rangestr == "range") {
+	range = true;
+      } else {
+	ss << "Did you mean to specify \"osd blocklist range\"?";
+	err = -EINVAL;
+	goto reply;
+      }
+    }
     entity_addr_t addr;
     if (!addr.parse(addrstr)) {
       ss << "unable to parse address " << addrstr;
@@ -12695,11 +12732,31 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       goto reply;
     }
     else {
-      if (osdmap.require_osd_release >= ceph_release_t::nautilus) {
-	// always blocklist type ANY
-	addr.set_type(entity_addr_t::TYPE_ANY);
+      if (range) {
+	if (!addr.maybe_cidr()) {
+	  ss << "You specified a range command, but " << addr
+	     << " does not parse as a CIDR range";
+	  err = -EINVAL;
+	  goto reply;
+	}
+	addr.type = entity_addr_t::TYPE_CIDR;
+	err = check_cluster_features(CEPH_FEATUREMASK_RANGE_BLOCKLIST, ss);
+	if (err) {
+	  goto reply;
+	}
+	if ((addr.is_ipv4() && addr.get_nonce() > 32) ||
+	    (addr.is_ipv6() && addr.get_nonce() > 128)) {
+	  ss << "Too many bits in range for that protocol!";
+	  err = -EINVAL;
+	  goto reply;
+	}
       } else {
-	addr.set_type(entity_addr_t::TYPE_LEGACY);
+	if (osdmap.require_osd_release >= ceph_release_t::nautilus) {
+	  // always blocklist type ANY
+	  addr.set_type(entity_addr_t::TYPE_ANY);
+	} else {
+	  addr.set_type(entity_addr_t::TYPE_LEGACY);
+	}
       }
 
       string blocklistop;
@@ -12713,16 +12770,27 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
           g_conf()->mon_osd_blocklist_default_expire);
 	expires += d;
 
-	pending_inc.new_blocklist[addr] = expires;
+	auto add_to_pending_blocklists = [](auto& nb, auto& ob,
+					    const auto& addr,
+					    const auto& expires) {
+	  nb[addr] = expires;
+	  // cancel any pending un-blocklisting request too
+	  auto it = std::find(ob.begin(),
+			      ob.end(), addr);
+	  if (it != ob.end()) {
+	    ob.erase(it);
+	  }
+	};
+	if (range) {
+	  add_to_pending_blocklists(pending_inc.new_range_blocklist,
+				    pending_inc.old_range_blocklist,
+				    addr, expires);
 
-        {
-          // cancel any pending un-blocklisting request too
-          auto it = std::find(pending_inc.old_blocklist.begin(),
-            pending_inc.old_blocklist.end(), addr);
-          if (it != pending_inc.old_blocklist.end()) {
-            pending_inc.old_blocklist.erase(it);
-          }
-        }
+	} else {
+	  add_to_pending_blocklists(pending_inc.new_blocklist,
+				    pending_inc.old_blocklist,
+				    addr, expires);
+	}
 
 	ss << "blocklisting " << addr << " until " << expires << " (" << d << " sec)";
 	getline(ss, rs);
@@ -12730,12 +12798,24 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 						  get_last_committed() + 1));
 	return true;
       } else if (blocklistop == "rm") {
-	if (osdmap.is_blocklisted(addr) ||
-	    pending_inc.new_blocklist.count(addr)) {
-	  if (osdmap.is_blocklisted(addr))
-	    pending_inc.old_blocklist.push_back(addr);
-	  else
-	    pending_inc.new_blocklist.erase(addr);
+	auto rm_from_pending_blocklists = [](const auto& addr,
+					     auto& blocklist,
+					     auto& ob, auto& pb) {
+	  if (blocklist.count(addr)) {
+	    ob.push_back(addr);
+	    return true;
+	  } else if (pb.count(addr)) {
+	    pb.erase(addr);
+	    return true;
+	  }
+	  return false;
+	};
+	if ((!range && rm_from_pending_blocklists(addr, osdmap.blocklist,
+						  pending_inc.old_blocklist,
+						  pending_inc.new_blocklist)) ||
+	    (range && rm_from_pending_blocklists(addr, osdmap.range_blocklist,
+						 pending_inc.old_range_blocklist,
+						 pending_inc.new_range_blocklist))) {
 	  ss << "un-blocklisting " << addr;
 	  getline(ss, rs);
 	  wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, 0, rs,
@@ -13448,6 +13528,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       ss << "unable to set cache-mode '" << pg_pool_t::get_cache_mode_name(mode)
          << "' on a '" << pg_pool_t::get_cache_mode_name(p->cache_mode)
          << "' pool; only '"
+         << pg_pool_t::get_cache_mode_name(pg_pool_t::CACHEMODE_PROXY)
+         << "','"
          << pg_pool_t::get_cache_mode_name(pg_pool_t::CACHEMODE_READPROXY)
         << "' allowed.";
       err = -EINVAL;
@@ -14634,7 +14716,7 @@ void OSDMonitor::trigger_degraded_stretch_mode(const set<int>& dead_buckets,
       newp.peering_crush_bucket_count = new_site_count;
       newp.peering_crush_mandatory_member = remaining_site;
       newp.min_size = pgi.second.min_size / 2; // only support 2 zones now
-      newp.last_force_op_resend = pending_inc.epoch;
+      newp.set_last_force_op_resend(pending_inc.epoch);
     }
   }
   propose_pending();
@@ -14654,7 +14736,7 @@ void OSDMonitor::trigger_recovery_stretch_mode()
   for (auto pgi : osdmap.pools) {
     if (pgi.second.peering_crush_bucket_count) {
       pg_pool_t& newp = *pending_inc.get_new_pool(pgi.first, &pgi.second);
-      newp.last_force_op_resend = pending_inc.epoch;
+      newp.set_last_force_op_resend(pending_inc.epoch);
     }
   }
   propose_pending();
@@ -14740,7 +14822,7 @@ void OSDMonitor::trigger_healthy_stretch_mode()
       newp.peering_crush_bucket_count = osdmap.stretch_bucket_count;
       newp.peering_crush_mandatory_member = CRUSH_ITEM_NONE;
       newp.min_size = g_conf().get_val<uint64_t>("mon_stretch_pool_min_size");
-      newp.last_force_op_resend = pending_inc.epoch;
+      newp.set_last_force_op_resend(pending_inc.epoch);
     }
   }
   propose_pending();

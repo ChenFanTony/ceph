@@ -127,7 +127,6 @@ struct error_code;
   class raw_static;
   class raw_posix_aligned;
   class raw_hack_aligned;
-  class raw_char;
   class raw_claimed_char;
   class raw_unshareable; // diagnostic, unshareable char buffer
   class raw_combined;
@@ -250,7 +249,6 @@ struct error_code;
 
     bool have_raw() const { return _raw ? true:false; }
 
-    ceph::unique_leakable_ptr<raw> clone();
     void swap(ptr& other) noexcept;
 
     iterator begin(size_t offset=0) {
@@ -596,13 +594,13 @@ struct error_code;
 	}
       }
       void clear_and_dispose() {
-	for (auto it = begin(); it != end(); /* nop */) {
-	  auto& node = *it;
-	  it = it->next;
-	  ptr_node::disposer()(&node);
-	}
-	_root.next = &_root;
-	_tail = &_root;
+        ptr_node::disposer dispose;
+        for (auto it = begin(), e = end(); it != e; /* nop */) {
+          auto& node = *it++;
+          dispose(&node);
+        }
+        _tail = &_root;
+        _root.next = _tail;
       }
       iterator erase_after_and_dispose(iterator it) {
 	auto* to_dispose = &*std::next(it);
@@ -865,7 +863,9 @@ struct error_code;
 	if (first_round) {
 	  impl_f(first_round);
 	}
-	if (const auto second_round = len - first_round; second_round) {
+	// no C++17 for the sake of the C++11 guarantees of librados, sorry.
+	const auto second_round = len - first_round;
+	if (second_round) {
 	  _refill(second_round);
 	  impl_f(second_round);
 	}

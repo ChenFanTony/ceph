@@ -34,16 +34,11 @@ function munge_ceph_spec_in {
     shift
     local for_make_check=$1
     shift
-    local with_jaeger=$1
-    shift
     local OUTFILE=$1
     sed -e 's/@//g' < ceph.spec.in > $OUTFILE
     # http://rpm.org/user_doc/conditional_builds.html
     if $with_seastar; then
         sed -i -e 's/%bcond_with seastar/%bcond_without seastar/g' $OUTFILE
-    fi
-    if $with_jaeger; then
-        sed -i -e 's/%bcond_with jaeger/%bcond_without jaeger/g' $OUTFILE
     fi
     if $with_zbd; then
         sed -i -e 's/%bcond_with zbd/%bcond_without zbd/g' $OUTFILE
@@ -63,10 +58,6 @@ function munge_debian_control {
 	    grep -v babeltrace debian/control > $control
 	    ;;
     esac
-    if $with_jaeger; then
-	sed -i -e 's/^# Jaeger[[:space:]]//g' $control
-	sed -i -e 's/^# Crimson      libyaml-cpp-dev,/d' $control
-    fi
     echo $control
 }
 
@@ -105,33 +96,6 @@ ENDOFKEY
 	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -y || true
 	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y g++-${new}
     fi
-
-    case "$codename" in
-        trusty)
-            old=4.8;;
-        xenial)
-            old=5;;
-        bionic)
-            old=7;;
-    esac
-    $SUDO update-alternatives --remove-all gcc || true
-    $SUDO update-alternatives \
-	 --install /usr/bin/gcc gcc /usr/bin/gcc-${new} 20 \
-	 --slave   /usr/bin/g++ g++ /usr/bin/g++-${new}
-
-    if [ -f /usr/bin/g++-${old} ]; then
-      $SUDO update-alternatives \
-  	 --install /usr/bin/gcc gcc /usr/bin/gcc-${old} 10 \
-  	 --slave   /usr/bin/g++ g++ /usr/bin/g++-${old}
-    fi
-
-    $SUDO update-alternatives --auto gcc
-
-    # cmake uses the latter by default
-    $SUDO ln -nsf /usr/bin/gcc /usr/bin/${ARCH}-linux-gnu-gcc
-    $SUDO ln -nsf /usr/bin/g++ /usr/bin/${ARCH}-linux-gnu-g++
-
-    in_jenkins && echo "CI_DEBUG: End ensure_decent_gcc_on_ubuntu() in install-deps.sh"
 }
 
 function ensure_python3_sphinx_on_ubuntu {
@@ -177,7 +141,7 @@ function install_pkg_on_ubuntu {
 
 function install_boost_on_ubuntu {
     in_jenkins && echo "CI_DEBUG: Running install_boost_on_ubuntu() in install-deps.sh"
-    local ver=1.75
+    local ver=1.79
     local installed_ver=$(apt -qq list --installed ceph-libboost*-dev 2>/dev/null |
                               grep -e 'libboost[0-9].[0-9]\+-dev' |
                               cut -d' ' -f2 |
@@ -192,7 +156,7 @@ function install_boost_on_ubuntu {
     fi
     local codename=$1
     local project=libboost
-    local sha1=7aba8a1882670522ee1d1ee1bba0ea170b292dec
+    local sha1=892ab89e76b91b505ffbf083f6fb7f2a666d4132
     install_pkg_on_ubuntu \
 	$project \
 	$sha1 \
@@ -229,22 +193,63 @@ function install_libzbd_on_ubuntu {
         libzbd-dev
 }
 
-function install_libpmem_on_ubuntu {
-    in_jenkins && echo "CI_DEBUG: Running install_libpmem_on_ubuntu() in install-deps.sh"
-    local codename=$1
-    local project=pmem
-    local sha1=7c18b4b1413ae965ea8bcbfc69eb9784f9212319
-    install_pkg_on_ubuntu \
-        $project \
-        $sha1 \
-        $codename \
+motr_pkgs_url='https://github.com/Seagate/cortx-motr/releases/download/2.0.0-rgw'
+
+function install_cortx_motr_on_ubuntu {
+    if dpkg -l cortx-motr-dev &> /dev/null; then
+        return
+    fi
+    if [ "$(lsb_release -sc)" = "jammy" ]; then
+      install_pkg_on_ubuntu \
+        cortx-motr \
+        39f89fa1c6945040433a913f2687c4b4e6cbeb3f \
+        jammy \
         check \
-        libpmem-dev \
-        libpmemobj-dev
+	cortx-motr \
+	cortx-motr-dev
+    else
+        local deb_arch=$(dpkg --print-architecture)
+        local motr_pkg="cortx-motr_2.0.0.git3252d623_$deb_arch.deb"
+        local motr_dev_pkg="cortx-motr-dev_2.0.0.git3252d623_$deb_arch.deb"
+        $SUDO curl -sL -o/var/cache/apt/archives/$motr_pkg $motr_pkgs_url/$motr_pkg
+        $SUDO curl -sL -o/var/cache/apt/archives/$motr_dev_pkg $motr_pkgs_url/$motr_dev_pkg
+        # For some reason libfabric pkg is not available in arm64 version
+        # of Ubuntu 20.04 (Focal Fossa), so we borrow it from more recent
+        # versions for now.
+        if [[ "$deb_arch" == 'arm64' ]]; then
+            local lf_pkg='libfabric1_1.11.0-2_arm64.deb'
+            $SUDO curl -sL -o/var/cache/apt/archives/$lf_pkg http://ports.ubuntu.com/pool/universe/libf/libfabric/$lf_pkg
+            $SUDO apt-get install -y /var/cache/apt/archives/$lf_pkg
+        fi
+        $SUDO apt-get install -y /var/cache/apt/archives/{$motr_pkg,$motr_dev_pkg}
+        $SUDO apt-get install -y libisal-dev
+    fi
 }
 
 function version_lt {
     test $1 != $(echo -e "$1\n$2" | sort -rV | head -n 1)
+}
+
+function ensure_decent_gcc_on_rh {
+    local old=$(gcc -dumpversion)
+    local dts_ver=$1
+    if version_lt $old $dts_ver; then
+	if test -t 1; then
+	    # interactive shell
+	    cat <<EOF
+Your GCC is too old. Please run following command to add DTS to your environment:
+
+scl enable gcc-toolset-$dts_ver bash
+
+Or add the following line to the end of ~/.bashrc and run "source ~/.bashrc" to add it permanently:
+
+source scl_source enable gcc-toolset-$dts_ver
+EOF
+	else
+	    # non-interactive shell
+	    source /opt/rh/gcc-toolset-$dts_ver/enable
+	fi
+    fi
 }
 
 for_make_check=false
@@ -316,11 +321,9 @@ if [ x$(uname)x = xFreeBSDx ]; then
     exit
 else
     [ $WITH_SEASTAR ] && with_seastar=true || with_seastar=false
-    [ $WITH_JAEGER ] && with_jaeger=true || with_jaeger=false
     [ $WITH_ZBD ] && with_zbd=true || with_zbd=false
     [ $WITH_PMEM ] && with_pmem=true || with_pmem=false
     [ $WITH_RADOSGW_MOTR ] && with_rgw_motr=true || with_rgw_motr=false
-    motr_pkgs_url='https://github.com/Seagate/cortx-motr/releases/download/2.0.0-rgw'
     source /etc/os-release
     case "$ID" in
     debian|ubuntu|devuan|elementary|softiron)
@@ -335,9 +338,13 @@ else
                 $with_zbd && install_libzbd_on_ubuntu bionic
                 ;;
             *Focal*)
+                ensure_decent_gcc_on_ubuntu 11 focal
                 [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu focal
                 $with_zbd && install_libzbd_on_ubuntu focal
-                $with_pmem && install_libpmem_on_ubuntu focal
+                ;;
+            *Jammy*)
+                [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu jammy
+                $SUDO apt-get install -y gcc
                 ;;
             *)
                 $SUDO apt-get install -y gcc
@@ -368,8 +375,8 @@ else
 	if $with_seastar; then
 	    build_profiles+=",pkg.ceph.crimson"
 	fi
-	if $with_jaeger; then
-	    build_profiles+=",pkg.ceph.jaeger"
+	if $with_pmem; then
+	    build_profiles+=",pkg.ceph.pmdk"
 	fi
 
         in_jenkins && cat <<EOF
@@ -389,23 +396,8 @@ EOF
 	if [ "$control" != "debian/control" ] ; then rm $control; fi
 
         # for rgw motr backend build checks
-        if ! dpkg -l cortx-motr-dev &> /dev/null &&
-            { [[ $FOR_MAKE_CHECK ]] || $with_rgw_motr; }; then
-            deb_arch=$(dpkg --print-architecture)
-            motr_pkg="cortx-motr_2.0.0.git3252d623_$deb_arch.deb"
-            motr_dev_pkg="cortx-motr-dev_2.0.0.git3252d623_$deb_arch.deb"
-            $SUDO curl -sL -o/var/cache/apt/archives/$motr_pkg $motr_pkgs_url/$motr_pkg
-            $SUDO curl -sL -o/var/cache/apt/archives/$motr_dev_pkg $motr_pkgs_url/$motr_dev_pkg
-            # For some reason libfabric pkg is not available in arm64 version
-            # of Ubuntu 20.04 (Focal Fossa), so we borrow it from more recent
-            # versions for now.
-            if [[ "$deb_arch" == 'arm64' ]]; then
-                lf_pkg='libfabric1_1.11.0-2_arm64.deb'
-                $SUDO curl -sL -o/var/cache/apt/archives/$lf_pkg http://ports.ubuntu.com/pool/universe/libf/libfabric/$lf_pkg
-                $SUDO apt-get install -y /var/cache/apt/archives/$lf_pkg
-            fi
-            $SUDO apt-get install -y /var/cache/apt/archives/{$motr_pkg,$motr_dev_pkg}
-            $SUDO apt-get install -y libisal-dev
+        if $with_rgw_motr; then
+            install_cortx_motr_on_ubuntu
         fi
         ;;
     rocky|centos|fedora|rhel|ol|virtuozzo)
@@ -417,7 +409,7 @@ EOF
                 ;;
             rocky|centos|rhel|ol|virtuozzo)
                 MAJOR_VERSION="$(echo $VERSION_ID | cut -d. -f1)"
-                $SUDO dnf install -y dnf-utils
+                $SUDO dnf install -y dnf-utils selinux-policy-targeted
                 rpm --quiet --query epel-release || \
 		    $SUDO dnf -y install --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-$MAJOR_VERSION.noarch.rpm
                 $SUDO rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-$MAJOR_VERSION
@@ -425,23 +417,30 @@ EOF
 		if test $ID = centos -a $MAJOR_VERSION = 8 ; then
                     # Enable 'powertools' or 'PowerTools' repo
                     $SUDO dnf config-manager --set-enabled $(dnf repolist --all 2>/dev/null|gawk 'tolower($0) ~ /^powertools\s/{print $1}')
+		    dts_ver=11
 		    # before EPEL8 and PowerTools provide all dependencies, we use sepia for the dependencies
                     $SUDO dnf config-manager --add-repo http://apt-mirror.front.sepia.ceph.com/lab-extras/8/
                     $SUDO dnf config-manager --setopt=apt-mirror.front.sepia.ceph.com_lab-extras_8_.gpgcheck=0 --save
+                    $SUDO dnf -y module enable javapackages-tools
                 elif test $ID = rhel -a $MAJOR_VERSION = 8 ; then
+                    dts_ver=11
                     $SUDO dnf config-manager --set-enabled "codeready-builder-for-rhel-8-${ARCH}-rpms"
 		    $SUDO dnf config-manager --add-repo http://apt-mirror.front.sepia.ceph.com/lab-extras/8/
 		    $SUDO dnf config-manager --setopt=apt-mirror.front.sepia.ceph.com_lab-extras_8_.gpgcheck=0 --save
+		    $SUDO dnf -y module enable javapackages-tools
                 fi
                 ;;
         esac
-        munge_ceph_spec_in $with_seastar $with_zbd $for_make_check $with_jaeger $DIR/ceph.spec
+        munge_ceph_spec_in $with_seastar $with_zbd $for_make_check $DIR/ceph.spec
         # for python3_pkgversion macro defined by python-srpm-macros, which is required by python3-devel
         $SUDO dnf install -y python3-devel
         $SUDO $builddepcmd $DIR/ceph.spec 2>&1 | tee $DIR/yum-builddep.out
         [ ${PIPESTATUS[0]} -ne 0 ] && exit 1
+	if [ -n "$dts_ver" ]; then
+            ensure_decent_gcc_on_rh $dts_ver
+	fi
         IGNORE_YUM_BUILDEP_ERRORS="ValueError: SELinux policy is not managed or store cannot be accessed."
-        sed "/$IGNORE_YUM_BUILDEP_ERRORS/d" $DIR/yum-builddep.out | grep -qi "error:" && exit 1
+        sed "/$IGNORE_YUM_BUILDEP_ERRORS/d" $DIR/yum-builddep.out | grep -i "error:" && exit 1
         # for rgw motr backend build checks
         if ! rpm --quiet -q cortx-motr-devel &&
               { [[ $FOR_MAKE_CHECK ]] || $with_rgw_motr; }; then
@@ -455,7 +454,7 @@ EOF
         echo "Using zypper to install dependencies"
         zypp_install="zypper --gpg-auto-import-keys --non-interactive install --no-recommends"
         $SUDO $zypp_install systemd-rpm-macros rpm-build || exit 1
-        munge_ceph_spec_in $with_seastar false $for_make_check $with_jaeger $DIR/ceph.spec
+        munge_ceph_spec_in $with_seastar false $for_make_check $DIR/ceph.spec
         $SUDO $zypp_install $(rpmspec -q --buildrequires $DIR/ceph.spec) || exit 1
         ;;
     *)
@@ -518,6 +517,7 @@ function preload_wheels_for_tox() {
     if test "$require" && ! test -d wheelhouse ; then
         type python3 > /dev/null 2>&1 || continue
         activate_virtualenv $top_srcdir || exit 1
+        python3 -m pip install --upgrade pip
         populate_wheelhouse "wheel -w $wip_wheelhouse" $require $constraint || exit 1
         mv $wip_wheelhouse wheelhouse
         md5sum $require_files $constraint_files > $md5

@@ -28,8 +28,10 @@ import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
 })
 export class ServiceFormComponent extends CdForm implements OnInit {
   readonly RGW_SVC_ID_PATTERN = /^([^.]+)(\.([^.]+)\.([^.]+))?$/;
+  readonly MDS_SVC_ID_PATTERN = /^[a-zA-Z_.-][a-zA-Z0-9_.-]*$/;
   readonly SNMP_DESTINATION_PATTERN = /^[^\:]+:[0-9]/;
   readonly SNMP_ENGINE_ID_PATTERN = /^[0-9A-Fa-f]{10,64}/g;
+  readonly INGRESS_SUPPORTED_SERVICE_TYPES = ['rgw', 'nfs'];
   @ViewChild(NgbTypeahead, { static: false })
   typeahead: NgbTypeahead;
 
@@ -45,6 +47,7 @@ export class ServiceFormComponent extends CdForm implements OnInit {
   action: string;
   resource: string;
   serviceTypes: string[] = [];
+  serviceIds: string[] = [];
   hosts: any;
   labels: string[];
   labelClick = new Subject<string>();
@@ -52,6 +55,7 @@ export class ServiceFormComponent extends CdForm implements OnInit {
   pools: Array<object>;
   services: Array<CephServiceSpec> = [];
   pageURL: string;
+  serviceList: CephServiceSpec[];
 
   constructor(
     public actionLabels: ActionLabelsI18n,
@@ -83,9 +87,20 @@ export class ServiceFormComponent extends CdForm implements OnInit {
       service_id: [
         null,
         [
-          CdValidators.requiredIf({
-            service_type: 'mds'
-          }),
+          CdValidators.composeIf(
+            {
+              service_type: 'mds'
+            },
+            [
+              Validators.required,
+              CdValidators.custom('mdsPattern', (value: string) => {
+                if (_.isEmpty(value)) {
+                  return false;
+                }
+                return !this.MDS_SVC_ID_PATTERN.test(value);
+              })
+            ]
+          ),
           CdValidators.requiredIf({
             service_type: 'nfs'
           }),
@@ -108,7 +123,10 @@ export class ServiceFormComponent extends CdForm implements OnInit {
                 return !this.RGW_SVC_ID_PATTERN.test(value);
               })
             ]
-          )
+          ),
+          CdValidators.custom('uniqueName', (service_id: string) => {
+            return this.serviceIds && this.serviceIds.includes(service_id);
+          })
         ]
       ],
       placement: ['hosts'],
@@ -129,8 +147,7 @@ export class ServiceFormComponent extends CdForm implements OnInit {
         null,
         [
           CdValidators.requiredIf({
-            service_type: 'iscsi',
-            unmanaged: false
+            service_type: 'iscsi'
           })
         ]
       ],
@@ -162,8 +179,7 @@ export class ServiceFormComponent extends CdForm implements OnInit {
         null,
         [
           CdValidators.requiredIf({
-            service_type: 'ingress',
-            unmanaged: false
+            service_type: 'ingress'
           })
         ]
       ],
@@ -171,13 +187,28 @@ export class ServiceFormComponent extends CdForm implements OnInit {
         null,
         [
           CdValidators.requiredIf({
-            service_type: 'ingress',
-            unmanaged: false
+            service_type: 'ingress'
           })
         ]
       ],
-      frontend_port: [null, [CdValidators.number(false)]],
-      monitor_port: [null, [CdValidators.number(false)]],
+      frontend_port: [
+        null,
+        [
+          CdValidators.number(false),
+          CdValidators.requiredIf({
+            service_type: 'ingress'
+          })
+        ]
+      ],
+      monitor_port: [
+        null,
+        [
+          CdValidators.number(false),
+          CdValidators.requiredIf({
+            service_type: 'ingress'
+          })
+        ]
+      ],
       virtual_interface_networks: [null],
       // RGW, Ingress & iSCSI
       ssl: [false],
@@ -199,6 +230,14 @@ export class ServiceFormComponent extends CdForm implements OnInit {
               ssl: true
             },
             [Validators.required, CdValidators.sslCert()]
+          ),
+          CdValidators.composeIf(
+            {
+              service_type: 'ingress',
+              unmanaged: false,
+              ssl: true
+            },
+            [Validators.required, CdValidators.pemCert()]
           )
         ]
       ],
@@ -310,6 +349,14 @@ export class ServiceFormComponent extends CdForm implements OnInit {
         this.serviceType = params.type;
       });
     }
+
+    this.cephServiceService.list().subscribe((services: CephServiceSpec[]) => {
+      this.serviceList = services;
+      this.services = services.filter((service: any) =>
+        this.INGRESS_SUPPORTED_SERVICE_TYPES.includes(service.service_type)
+      );
+    });
+
     this.cephServiceService.getKnownTypes().subscribe((resp: Array<string>) => {
       // Remove service types:
       // osd       - This is deployed a different way.
@@ -333,9 +380,6 @@ export class ServiceFormComponent extends CdForm implements OnInit {
     });
     this.poolService.getList().subscribe((resp: Array<object>) => {
       this.pools = resp;
-    });
-    this.cephServiceService.list().subscribe((services: CephServiceSpec[]) => {
-      this.services = services.filter((service: any) => service.service_type === 'rgw');
     });
 
     if (this.editing) {
@@ -434,6 +478,12 @@ export class ServiceFormComponent extends CdForm implements OnInit {
     }
   }
 
+  getServiceIds(selectedServiceType: string) {
+    this.serviceIds = this.serviceList
+      ?.filter((service) => service['service_type'] === selectedServiceType)
+      .map((service) => service['service_id']);
+  }
+
   disableForEditing(serviceType: string) {
     const disableForEditKeys = ['service_type', 'service_id'];
     disableForEditKeys.forEach((key) => {
@@ -509,6 +559,47 @@ export class ServiceFormComponent extends CdForm implements OnInit {
       serviceName = `${serviceType}.${serviceId}`;
       serviceSpec['service_id'] = serviceId;
     }
+
+    // These services has some fields to be
+    // filled out even if unmanaged is true
+    switch (serviceType) {
+      case 'ingress':
+        serviceSpec['backend_service'] = values['backend_service'];
+        serviceSpec['service_id'] = values['backend_service'];
+        if (_.isNumber(values['frontend_port']) && values['frontend_port'] > 0) {
+          serviceSpec['frontend_port'] = values['frontend_port'];
+        }
+        if (_.isString(values['virtual_ip']) && !_.isEmpty(values['virtual_ip'])) {
+          serviceSpec['virtual_ip'] = values['virtual_ip'].trim();
+        }
+        if (_.isNumber(values['monitor_port']) && values['monitor_port'] > 0) {
+          serviceSpec['monitor_port'] = values['monitor_port'];
+        }
+        break;
+
+      case 'iscsi':
+        serviceSpec['pool'] = values['pool'];
+        break;
+
+      case 'snmp-gateway':
+        serviceSpec['credentials'] = {};
+        serviceSpec['snmp_version'] = values['snmp_version'];
+        serviceSpec['snmp_destination'] = values['snmp_destination'];
+        if (values['snmp_version'] === 'V3') {
+          serviceSpec['engine_id'] = values['engine_id'];
+          serviceSpec['auth_protocol'] = values['auth_protocol'];
+          serviceSpec['credentials']['snmp_v3_auth_username'] = values['snmp_v3_auth_username'];
+          serviceSpec['credentials']['snmp_v3_auth_password'] = values['snmp_v3_auth_password'];
+          if (values['privacy_protocol'] !== null) {
+            serviceSpec['privacy_protocol'] = values['privacy_protocol'];
+            serviceSpec['credentials']['snmp_v3_priv_password'] = values['snmp_v3_priv_password'];
+          }
+        } else {
+          serviceSpec['credentials']['snmp_community'] = values['snmp_community'];
+        }
+        break;
+    }
+
     if (!values['unmanaged']) {
       switch (values['placement']) {
         case 'hosts':
@@ -534,7 +625,6 @@ export class ServiceFormComponent extends CdForm implements OnInit {
           }
           break;
         case 'iscsi':
-          serviceSpec['pool'] = values['pool'];
           if (_.isString(values['trusted_ip_list']) && !_.isEmpty(values['trusted_ip_list'])) {
             serviceSpec['trusted_ip_list'] = values['trusted_ip_list'].trim();
           }
@@ -550,40 +640,12 @@ export class ServiceFormComponent extends CdForm implements OnInit {
           }
           break;
         case 'ingress':
-          serviceSpec['backend_service'] = values['backend_service'];
-          serviceSpec['service_id'] = values['backend_service'];
-          if (_.isString(values['virtual_ip']) && !_.isEmpty(values['virtual_ip'])) {
-            serviceSpec['virtual_ip'] = values['virtual_ip'].trim();
-          }
-          if (_.isNumber(values['frontend_port']) && values['frontend_port'] > 0) {
-            serviceSpec['frontend_port'] = values['frontend_port'];
-          }
-          if (_.isNumber(values['monitor_port']) && values['monitor_port'] > 0) {
-            serviceSpec['monitor_port'] = values['monitor_port'];
-          }
           serviceSpec['ssl'] = values['ssl'];
           if (values['ssl']) {
             serviceSpec['ssl_cert'] = values['ssl_cert']?.trim();
             serviceSpec['ssl_key'] = values['ssl_key']?.trim();
           }
           serviceSpec['virtual_interface_networks'] = values['virtual_interface_networks'];
-          break;
-        case 'snmp-gateway':
-          serviceSpec['credentials'] = {};
-          serviceSpec['snmp_version'] = values['snmp_version'];
-          serviceSpec['snmp_destination'] = values['snmp_destination'];
-          if (values['snmp_version'] === 'V3') {
-            serviceSpec['engine_id'] = values['engine_id'];
-            serviceSpec['auth_protocol'] = values['auth_protocol'];
-            serviceSpec['credentials']['snmp_v3_auth_username'] = values['snmp_v3_auth_username'];
-            serviceSpec['credentials']['snmp_v3_auth_password'] = values['snmp_v3_auth_password'];
-            if (values['privacy_protocol'] !== null) {
-              serviceSpec['privacy_protocol'] = values['privacy_protocol'];
-              serviceSpec['credentials']['snmp_v3_priv_password'] = values['snmp_v3_priv_password'];
-            }
-          } else {
-            serviceSpec['credentials']['snmp_community'] = values['snmp_community'];
-          }
           break;
       }
     }
@@ -593,7 +655,9 @@ export class ServiceFormComponent extends CdForm implements OnInit {
         task: new FinishedTask(taskUrl, {
           service_name: serviceName
         }),
-        call: this.cephServiceService.create(serviceSpec)
+        call: this.editing
+          ? this.cephServiceService.update(serviceSpec)
+          : this.cephServiceService.create(serviceSpec)
       })
       .subscribe({
         error() {

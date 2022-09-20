@@ -104,7 +104,7 @@ void WriteLog<I>::alloc_op_log_entries(GenericLogOperations &ops)
   ceph_assert(ceph_mutex_is_locked_by_me(this->m_log_append_lock));
 
   /* Allocate the (already reserved) log entries */
-  std::lock_guard locker(m_lock);
+  std::unique_lock locker(m_lock);
 
   for (auto &operation : ops) {
     uint32_t entry_index = this->m_first_free_entry;
@@ -113,13 +113,14 @@ void WriteLog<I>::alloc_op_log_entries(GenericLogOperations &ops)
     log_entry->log_entry_index = entry_index;
     log_entry->ram_entry.entry_index = entry_index;
     log_entry->cache_entry = &pmem_log_entries[entry_index];
-    log_entry->ram_entry.entry_valid = 1;
+    log_entry->ram_entry.set_entry_valid(true);
     m_log_entries.push_back(log_entry);
     ldout(m_image_ctx.cct, 20) << "operation=[" << *operation << "]" << dendl;
   }
   if (m_cache_state->empty && !m_log_entries.empty()) {
     m_cache_state->empty = false;
     this->update_image_cache_state();
+    this->write_image_cache_state(locker);
   }
 }
 
@@ -250,8 +251,6 @@ void WriteLog<I>::remove_pool_file() {
         lderr(m_image_ctx.cct) << "failed to remove empty pool \"" << this->m_log_pool_name << "\": "
           << pmemobj_errormsg() << dendl;
       } else {
-        m_cache_state->clean = true;
-        m_cache_state->empty = true;
         m_cache_state->present = false;
       }
   } else {
@@ -549,6 +548,7 @@ bool WriteLog<I>::retire_entries(const unsigned long int frees_per_tx) {
     m_perfcounter->hinc(l_librbd_pwl_retire_tx_t_hist, utime_t(tx_end - tx_start).to_nsec(),
         retiring_entries.size());
 
+    bool need_update_state = false;
     /* Update runtime copy of first_valid, and free entries counts */
     {
       std::lock_guard locker(m_lock);
@@ -559,6 +559,7 @@ bool WriteLog<I>::retire_entries(const unsigned long int frees_per_tx) {
       if (!m_cache_state->empty && m_log_entries.empty()) {
         m_cache_state->empty = true;
         this->update_image_cache_state();
+        need_update_state = true;
       }
       for (auto &entry: retiring_entries) {
         if (entry->write_bytes()) {
@@ -574,6 +575,10 @@ bool WriteLog<I>::retire_entries(const unsigned long int frees_per_tx) {
       }
       this->m_alloc_failed_since_retire = false;
       this->wake_up();
+    }
+    if (need_update_state) {
+      std::unique_lock locker(m_lock);
+      this->write_image_cache_state(locker);
     }
   } else {
     ldout(cct, 20) << "Nothing to retire" << dendl;

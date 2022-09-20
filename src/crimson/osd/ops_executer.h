@@ -40,13 +40,20 @@ class OpsExecuter : public seastar::enable_lw_shared_from_this<OpsExecuter> {
   using call_errorator = crimson::errorator<
     crimson::stateful_ec,
     crimson::ct_error::enoent,
+    crimson::ct_error::eexist,
+    crimson::ct_error::enospc,
+    crimson::ct_error::edquot,
+    crimson::ct_error::cmp_fail,
+    crimson::ct_error::eagain,
     crimson::ct_error::invarg,
     crimson::ct_error::erange,
     crimson::ct_error::ecanceled,
+    crimson::ct_error::enametoolong,
     crimson::ct_error::permission_denied,
     crimson::ct_error::operation_not_supported,
     crimson::ct_error::input_output_error,
-    crimson::ct_error::value_too_large>;
+    crimson::ct_error::value_too_large,
+    crimson::ct_error::file_too_large>;
   using read_errorator = PGBackend::read_errorator;
   using write_ertr = PGBackend::write_ertr;
   using get_attr_errorator = PGBackend::get_attr_errorator;
@@ -94,6 +101,7 @@ public:
     virtual epoch_t get_map_epoch() const = 0;
     virtual entity_inst_t get_orig_source_inst() const = 0;
     virtual uint64_t get_features() const = 0;
+    virtual bool has_flag(uint32_t flag) const = 0;
   };
 
   template <class ImplT>
@@ -107,6 +115,9 @@ public:
     }
     osd_reqid_t get_reqid() const final {
       return pimpl->get_reqid();
+    }
+    bool has_flag(uint32_t flag) const final {
+      return pimpl->has_flag(flag);
     }
     utime_t get_mtime() const final {
       return pimpl->get_mtime();
@@ -139,6 +150,7 @@ public:
     ::crimson::interruptible::interruptible_errorator<
       IOInterruptCondition, osd_op_errorator>;
 
+  object_stat_sum_t delta_stats;
 private:
   // an operation can be divided into two stages: main and effect-exposing
   // one. The former is performed immediately on call to `do_osd_op()` while
@@ -155,6 +167,8 @@ private:
 
   Ref<PG> pg; // for the sake of object class
   ObjectContextRef obc;
+  ObjectContextRef clone_obc; // if we create a clone
+  ObjectState head_os;
   const OpInfo& op_info;
   ceph::static_ptr<ExecutableMessage,
                    sizeof(ExecutableMessagePimpl<void>)> msg;
@@ -164,7 +178,8 @@ private:
 
   size_t num_read = 0;    ///< count read ops
   size_t num_write = 0;   ///< count update ops
-  object_stat_sum_t delta_stats;
+
+  SnapContext snapc; // writer snap context
 
   // this gizmo could be wrapped in std::optional for the sake of lazy
   // initialization. we don't need it for ops that doesn't have effect
@@ -221,8 +236,13 @@ private:
     return do_const_op(std::forward<Func>(f));
   }
 
+  enum class modified_by {
+    user,
+    sys,
+  };
+
   template <class Func>
-  auto do_write_op(Func&& f, bool um);
+  auto do_write_op(Func&& f, modified_by m = modified_by::user);
 
   decltype(auto) dont_do_legacy_op() {
     return crimson::ct_error::operation_not_supported::make();
@@ -236,11 +256,13 @@ public:
   OpsExecuter(Ref<PG> pg,
               ObjectContextRef obc,
               const OpInfo& op_info,
-              const MsgT& msg)
+              const MsgT& msg,
+              const SnapContext& snapc)
     : pg(std::move(pg)),
       obc(std::move(obc)),
       op_info(op_info),
-      msg(std::in_place_type_t<ExecutableMessagePimpl<MsgT>>{}, &msg) {
+      msg(std::in_place_type_t<ExecutableMessagePimpl<MsgT>>{}, &msg),
+      snapc(snapc) {
   }
 
   template <class Func>
@@ -257,10 +279,21 @@ public:
   using rep_op_fut_t =
     interruptible_future<rep_op_fut_tuple>;
   template <typename MutFunc>
-  rep_op_fut_t flush_changes_n_do_ops_effects(MutFunc&& mut_func) &&;
+  rep_op_fut_t flush_changes_n_do_ops_effects(const std::vector<OSDOp>& ops,
+    MutFunc&& mut_func) &&;
+  std::vector<pg_log_entry_t> prepare_transaction(
+    const std::vector<OSDOp>& ops);
+  void fill_op_params_bump_pg_version();
 
+  ObjectContextRef get_obc() const {
+    return obc;
+  }
+
+  const object_info_t &get_object_info() const {
+    return obc->obs.oi;
+  }
   const hobject_t &get_target() const {
-    return obc->obs.oi.soid;
+    return get_object_info().soid;
   }
 
   const auto& get_message() const {
@@ -282,6 +315,17 @@ public:
   }
 
   version_t get_last_user_version() const;
+
+  const SnapContext& get_snapc() const {
+    return snapc;
+  }
+
+  void make_writeable(std::vector<pg_log_entry_t>& log_entries);
+
+  const object_info_t prepare_clone(
+    const hobject_t& coid);
+
+  void apply_stats();
 };
 
 template <class Context, class MainFunc, class EffectFunc>
@@ -323,7 +367,9 @@ auto OpsExecuter::with_effect_on_obc(
 
 template <typename MutFunc>
 OpsExecuter::rep_op_fut_t
-OpsExecuter::flush_changes_n_do_ops_effects(MutFunc&& mut_func) &&
+OpsExecuter::flush_changes_n_do_ops_effects(
+  const std::vector<OSDOp>& ops,
+  MutFunc&& mut_func) &&
 {
   const bool want_mutate = !txn.empty();
   // osd_op_params are instantiated by every wr-like operation.
@@ -334,12 +380,14 @@ OpsExecuter::flush_changes_n_do_ops_effects(MutFunc&& mut_func) &&
 	seastar::now(),
 	interruptor::make_interruptible(osd_op_errorator::now()));
   if (want_mutate) {
-    osd_op_params->req_id = msg->get_reqid();
-    osd_op_params->mtime = msg->get_mtime();
+    fill_op_params_bump_pg_version();
+    auto log_entries = prepare_transaction(ops);
+    make_writeable(log_entries);
+    apply_stats();
     auto [submitted, all_completed] = std::forward<MutFunc>(mut_func)(std::move(txn),
                                                     std::move(obc),
                                                     std::move(*osd_op_params),
-                                                    user_modify);
+                                                    std::move(log_entries));
     maybe_mutated = interruptor::make_ready_future<rep_op_fut_tuple>(
 	std::move(submitted),
 	osd_op_ierrorator::future<>(std::move(all_completed)));

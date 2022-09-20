@@ -266,7 +266,7 @@ int KernelDevice::open(const string& p)
 	  << byte_u_t(size) << ")"
 	  << " block_size " << block_size
 	  << " (" << byte_u_t(block_size) << ")"
-	  << " " << (rotational ? "rotational" : "non-rotational")
+	  << " " << (rotational ? "rotational device," : "non-rotational device,")
       << " discard " << (support_discard ? "supported" : "not supported")
 	  << dendl;
   return 0;
@@ -1064,11 +1064,6 @@ struct ExplicitHugePagePool {
     ~mmaped_buffer_raw() override {
       // don't delete nor unmmap; recycle the region instead
       region_q.push(data);
-    }
-    raw* clone_empty() override {
-      // the entire cloning facility is used solely by the dev-only MemDB.
-      // see: https://github.com/ceph/ceph/pull/36282
-      ceph_abort_msg("this should be never called on this path!");
     }
   };
 
