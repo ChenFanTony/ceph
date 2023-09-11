@@ -28,8 +28,11 @@ class ShardServices;
 
 class ClientRequest final : public PhasedOperationT<ClientRequest>,
                             private CommonClientRequest {
-  OSD &osd;
-  const crimson::net::ConnectionRef conn;
+  // Initially set to primary core, updated to pg core after move,
+  // used by put_historic
+  ShardServices *put_historic_shard_services = nullptr;
+
+  crimson::net::ConnectionRef conn;
   // must be after conn due to ConnectionPipeline's life-time
   Ref<MOSDOp> m;
   OpInfo op_info;
@@ -38,6 +41,7 @@ class ClientRequest final : public PhasedOperationT<ClientRequest>,
 
 public:
   class PGPipeline : public CommonPGPipeline {
+    public:
     struct AwaitMap : OrderedExclusivePhaseT<AwaitMap> {
       static constexpr auto type_name = "ClientRequest::PGPipeline::await_map";
     } await_map;
@@ -50,6 +54,9 @@ public:
     friend class ClientRequest;
     friend class LttngBackend;
     friend class HistoricBackend;
+    friend class ReqRequest;
+    friend class LogMissingRequest;
+    friend class LogMissingRequestReply;
   };
 
   /**
@@ -79,10 +86,15 @@ public:
     CompletionEvent
   > tracking_events;
 
-  class instance_handle_t
-    : public seastar::enable_lw_shared_from_this<instance_handle_t> {
+  class instance_handle_t : public boost::intrusive_ref_counter<
+    instance_handle_t, boost::thread_unsafe_counter> {
   public:
-    using ref_t = seastar::lw_shared_ptr<instance_handle_t>;
+    // intrusive_ptr because seastar::lw_shared_ptr includes a cpu debug check
+    // that we will fail since the core on which we allocate the request may not
+    // be the core on which we perform with_pg_int.  This is harmless, since we
+    // don't leave any references on the source core, so we just bypass it by using
+    // intrusive_ptr instead.
+    using ref_t = boost::intrusive_ptr<instance_handle_t>;
     PipelineHandle handle;
 
     std::tuple<
@@ -144,7 +156,7 @@ public:
   };
   instance_handle_t::ref_t instance_handle;
   void reset_instance_handle() {
-    instance_handle = seastar::make_lw_shared<instance_handle_t>();
+    instance_handle = new instance_handle_t;
   }
   auto get_instance_handle() { return instance_handle; }
 
@@ -178,7 +190,9 @@ public:
 
   static constexpr OperationTypeCode type = OperationTypeCode::client_request;
 
-  ClientRequest(OSD &osd, crimson::net::ConnectionRef, Ref<MOSDOp> &&m);
+  ClientRequest(
+    ShardServices &shard_services,
+    crimson::net::ConnectionRef, Ref<MOSDOp> &&m);
   ~ClientRequest();
 
   void print(std::ostream &) const final;
@@ -188,28 +202,36 @@ public:
   spg_t get_pgid() const {
     return m->get_spg();
   }
-  ConnectionPipeline &get_connection_pipeline();
   PipelineHandle &get_handle() { return instance_handle->handle; }
   epoch_t get_epoch() const { return m->get_min_epoch(); }
 
+  ConnectionPipeline &get_connection_pipeline();
+  seastar::future<crimson::net::ConnectionFRef> prepare_remote_submission() {
+    assert(conn);
+    return conn.get_foreign(
+    ).then([this](auto f_conn) {
+      conn.reset();
+      return f_conn;
+    });
+  }
+  void finish_remote_submission(crimson::net::ConnectionFRef _conn) {
+    assert(!conn);
+    conn = make_local_shared_foreign(std::move(_conn));
+  }
+
   seastar::future<> with_pg_int(
     ShardServices &shard_services, Ref<PG> pg);
-public:
-  bool same_session_and_pg(const ClientRequest& other_op) const;
 
+public:
   seastar::future<> with_pg(
     ShardServices &shard_services, Ref<PG> pgref);
+
 private:
   template <typename FuncT>
   interruptible_future<> with_sequencer(FuncT&& func);
-  auto reply_op_error(Ref<PG>& pg, int err);
+  auto reply_op_error(const Ref<PG>& pg, int err);
 
-  enum class seq_mode_t {
-    IN_ORDER,
-    OUT_OF_ORDER
-  };
-
-  interruptible_future<seq_mode_t> do_process(
+  interruptible_future<> do_process(
     instance_handle_t &ihref,
     Ref<PG>& pg,
     crimson::osd::ObjectContextRef obc);
@@ -217,13 +239,12 @@ private:
     ::crimson::osd::IOInterruptCondition> process_pg_op(
     Ref<PG> &pg);
   ::crimson::interruptible::interruptible_future<
-    ::crimson::osd::IOInterruptCondition, seq_mode_t> process_op(
+    ::crimson::osd::IOInterruptCondition> process_op(
       instance_handle_t &ihref,
       Ref<PG> &pg);
   bool is_pg_op() const;
 
-  ConnectionPipeline &cp();
-  PGPipeline &pp(PG &pg);
+  PGPipeline &client_pp(PG &pg);
 
   template <typename Errorator>
   using interruptible_errorator =
@@ -232,6 +253,10 @@ private:
       Errorator>;
 
   bool is_misdirected(const PG& pg) const;
+
+  const SnapContext get_snapc(
+    Ref<PG>& pg,
+    crimson::osd::ObjectContextRef obc) const;
 
 public:
 
@@ -250,3 +275,7 @@ public:
 };
 
 }
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<crimson::osd::ClientRequest> : fmt::ostream_formatter {};
+#endif

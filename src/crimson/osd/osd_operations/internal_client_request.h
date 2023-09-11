@@ -39,7 +39,7 @@ private:
   void print(std::ostream &) const final;
   void dump_detail(Formatter *f) const final;
 
-  CommonPGPipeline& pp();
+  CommonPGPipeline& client_pp();
 
   seastar::future<> do_process();
 
@@ -62,3 +62,7 @@ public:
 };
 
 } // namespace crimson::osd
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<crimson::osd::InternalClientRequest> : fmt::ostream_formatter {};
+#endif

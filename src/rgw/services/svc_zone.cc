@@ -6,9 +6,9 @@
 #include "svc_sys_obj.h"
 #include "svc_sync_modules.h"
 
-#include "rgw/rgw_zone.h"
-#include "rgw/rgw_rest_conn.h"
-#include "rgw/rgw_bucket_sync.h"
+#include "rgw_zone.h"
+#include "rgw_rest_conn.h"
+#include "rgw_bucket_sync.h"
 
 #include "common/errno.h"
 #include "include/random.h"
@@ -62,6 +62,21 @@ std::shared_ptr<RGWBucketSyncPolicyHandler> RGWSI_Zone::get_sync_policy_handler(
 bool RGWSI_Zone::zone_syncs_from(const RGWZone& target_zone, const RGWZone& source_zone) const
 {
   return target_zone.syncs_from(source_zone.name) &&
+         sync_modules_svc->get_manager()->supports_data_export(source_zone.tier_type);
+}
+
+bool RGWSI_Zone::zone_syncs_from(const RGWZone& source_zone) const
+{
+  auto target_zone = get_zone();
+  bool found = false;
+
+  for (auto s : data_sync_source_zones) {
+    if (s->id == source_zone.id) {
+      found = true;
+      break;
+    }
+  }
+  return found && target_zone.syncs_from(source_zone.name) &&
          sync_modules_svc->get_manager()->supports_data_export(source_zone.tier_type);
 }
 
@@ -720,7 +735,7 @@ bool RGWSI_Zone::need_to_sync() const
 
 bool RGWSI_Zone::need_to_log_data() const
 {
-  return zone_public_config->log_data;
+  return (zone_public_config->log_data && sync_module_exports_data());
 }
 
 bool RGWSI_Zone::is_meta_master() const

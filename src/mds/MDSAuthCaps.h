@@ -93,6 +93,17 @@ struct MDSCapSpec {
   bool allow_full() const {
     return (caps & FULL);
   }
+
+  unsigned get_caps() {
+    return caps;
+  }
+
+  void set_caps(unsigned int _caps) {
+    caps = _caps;
+  }
+
+  std::string to_string();
+
 private:
   unsigned caps = 0;
 };
@@ -101,30 +112,17 @@ private:
 struct MDSCapMatch {
   static const int64_t MDS_AUTH_UID_ANY = -1;
 
-  MDSCapMatch() : uid(MDS_AUTH_UID_ANY), fs_name(std::string()) {}
+  MDSCapMatch() {}
 
-  MDSCapMatch(int64_t uid_, std::vector<gid_t>& gids_) :
-    uid(uid_), gids(gids_), fs_name(std::string()) {}
+  MDSCapMatch(const std::string& fsname_, const std::string& path_,
+	      bool root_squash_, int64_t uid_=MDS_AUTH_UID_ANY,
+	      const std::vector<gid_t>& gids_={}) {
+    fs_name = std::move(fsname_);
+    path = std::move(path_);
+    root_squash = root_squash_;
+    uid = (uid_ == 0) ? -1 : uid_;
+    gids = gids_;
 
-  explicit MDSCapMatch(const std::string &path_)
-    : uid(MDS_AUTH_UID_ANY), path(path_), fs_name(std::string()) {
-    normalize_path();
-  }
-
-  explicit MDSCapMatch(std::string path, std::string fs_name) :
-    uid(MDS_AUTH_UID_ANY), path(std::move(path)), fs_name(std::move(fs_name))
-  {
-    normalize_path();
-  }
-
-  explicit MDSCapMatch(std::string path, std::string fs_name, bool root_squash_) :
-    uid(MDS_AUTH_UID_ANY), path(std::move(path)), fs_name(std::move(fs_name)), root_squash(root_squash_)
-  {
-    normalize_path();
-  }
-
-  MDSCapMatch(const std::string& path_, int64_t uid_, std::vector<gid_t>& gids_)
-    : uid(uid_), gids(gids_), path(path_), fs_name(std::string()) {
     normalize_path();
   }
 
@@ -148,8 +146,10 @@ struct MDSCapMatch {
    * @param target_path filesystem path without leading '/'
    */
   bool match_path(std::string_view target_path) const;
+  std::string to_string();
 
-  int64_t uid;       // Require UID to be equal to this, if !=MDS_AUTH_UID_ANY
+  // Require UID to be equal to this, if !=MDS_AUTH_UID_ANY
+  int64_t uid = MDS_AUTH_UID_ANY;
   std::vector<gid_t> gids;  // Use these GIDs
   std::string path;  // Require path to be child of this (may be "" or "/" for any)
   std::string fs_name;
@@ -168,6 +168,7 @@ struct MDSCapGrant {
   MDSCapGrant() {}
 
   void parse_network();
+  std::string to_string();
 
   MDSCapSpec spec;
   MDSCapMatch match;
@@ -183,9 +184,8 @@ class MDSAuthCaps
 {
 public:
   MDSAuthCaps() = default;
-  explicit MDSAuthCaps(CephContext *cct_) : cct(cct_) {}
 
-  // this ctor is used by spirit/phoenix; doesn't need cct.
+  // this ctor is used by spirit/phoenix
   explicit MDSAuthCaps(const std::vector<MDSCapGrant>& grants_) : grants(grants_) {}
 
   void clear() {
@@ -193,7 +193,8 @@ public:
   }
 
   void set_allow_all();
-  bool parse(CephContext *cct, std::string_view str, std::ostream *err);
+  bool parse(std::string_view str, std::ostream *err);
+  bool merge(MDSAuthCaps newcap);
 
   bool allow_all() const;
   bool is_capable(std::string_view inode_path,
@@ -224,9 +225,10 @@ public:
     return false;
   }
 
+
   friend std::ostream &operator<<(std::ostream &out, const MDSAuthCaps &cap);
+  std::string to_string();
 private:
-  CephContext *cct = nullptr;
   std::vector<MDSCapGrant> grants;
 };
 

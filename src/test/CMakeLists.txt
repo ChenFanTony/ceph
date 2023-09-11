@@ -22,22 +22,21 @@ add_subdirectory(librados_test_stub)
 if(WITH_LIBRADOSSTRIPER)
   add_subdirectory(libradosstriper)
 endif()
-if(WITH_RBD AND NOT WIN32)
-  # librbd tests require libcls*, which in turn require libos and libosd, which
-  # haven't been ported to Windows yet.
+if(WITH_RBD)
   add_subdirectory(librbd)
-endif(WITH_RBD AND NOT WIN32)
+endif()
 if (WITH_CEPHFS)
   add_subdirectory(mds)
 endif()
 add_subdirectory(pybind)
+add_subdirectory(dokan)
+add_subdirectory(libcephfs)
 
 # Not available on Windows for the time being.
 if(NOT WIN32)
   # libcls_* dependencies cascade to osd, kv and other libs that are not
   # available on Windows yet.
   add_subdirectory(cls_hello)
-  add_subdirectory(cls_fifo)
   add_subdirectory(cls_cas)
   add_subdirectory(cls_lock)
   add_subdirectory(cls_log)
@@ -58,9 +57,7 @@ if(NOT WIN32)
   add_subdirectory(journal)
 
   add_subdirectory(erasure-code)
-  add_subdirectory(filestore)
   add_subdirectory(fs)
-  add_subdirectory(libcephfs)
   add_subdirectory(libcephsqlite)
   add_subdirectory(client)
   add_subdirectory(mon)
@@ -71,10 +68,10 @@ if(NOT WIN32)
   add_subdirectory(neorados)
   add_subdirectory(objectstore)
   add_subdirectory(ObjectMap)
-  add_subdirectory(os)
   add_subdirectory(osd)
   add_subdirectory(osdc)
   add_subdirectory(immutable_object_cache)
+  add_subdirectory(exporter)
 endif(NOT WIN32)
 
 if(WITH_RADOSGW)
@@ -283,8 +280,16 @@ target_link_libraries(ceph_test_librgw_file
   ceph-common
   ${UNITTEST_LIBS}
   ${EXTRALIBS}
+  ${ALLOC_LIBS}
   )
 install(TARGETS ceph_test_librgw_file DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+add_dependencies(ceph_test_librgw_file
+  ceph_test_librgw_file_cd
+  ceph_test_librgw_file_gp
+  ceph_test_librgw_file_nfsns
+  ceph_test_librgw_file_aw
+  ceph_test_librgw_file_marker)
 
 # ceph_test_librgw_file_cd (just the rgw_file create-delete bucket ops)
 add_executable(ceph_test_librgw_file_cd
@@ -296,6 +301,7 @@ target_link_libraries(ceph_test_librgw_file_cd
   ceph-common
   ${UNITTEST_LIBS}
   ${EXTRALIBS}
+  ${ALLOC_LIBS}
   )
 install(TARGETS ceph_test_librgw_file_cd DESTINATION ${CMAKE_INSTALL_BINDIR})
 
@@ -309,6 +315,7 @@ target_link_libraries(ceph_test_librgw_file_gp
   ceph-common
   ${UNITTEST_LIBS}
   ${EXTRALIBS}
+  ${ALLOC_LIBS}
   )
 install(TARGETS ceph_test_librgw_file_gp DESTINATION ${CMAKE_INSTALL_BINDIR})
 
@@ -318,7 +325,8 @@ add_executable(ceph_test_librgw_file_nfsns
   )
 target_include_directories(ceph_test_librgw_file_nfsns
   PUBLIC "${LUA_INCLUDE_DIR}"
-  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/driver/rados")
 target_link_libraries(ceph_test_librgw_file_nfsns
   rgw
   librados
@@ -326,6 +334,7 @@ target_link_libraries(ceph_test_librgw_file_nfsns
   ${UNITTEST_LIBS}
   ${EXTRALIBS}
   ${LUA_LIBRARIES}
+  ${ALLOC_LIBS}
   )
   target_link_libraries(ceph_test_librgw_file_nfsns spawn)
 install(TARGETS ceph_test_librgw_file_nfsns DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -340,6 +349,7 @@ target_link_libraries(ceph_test_librgw_file_aw
   ceph-common
   ${UNITTEST_LIBS}
   ${EXTRALIBS}
+  ${ALLOC_LIBS}
   )
 install(TARGETS ceph_test_librgw_file_aw DESTINATION ${CMAKE_INSTALL_BINDIR})
 
@@ -349,7 +359,8 @@ add_executable(ceph_test_librgw_file_marker
   )
 target_include_directories(ceph_test_librgw_file_marker
   PUBLIC "${LUA_INCLUDE_DIR}"
-  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/driver/rados")
 target_link_libraries(ceph_test_librgw_file_marker
   rgw
   librados
@@ -357,17 +368,18 @@ target_link_libraries(ceph_test_librgw_file_marker
   ${UNITTEST_LIBS}
   ${EXTRALIBS}
   ${LUA_LIBRARIES}
+  ${ALLOC_LIBS}
   )
   target_link_libraries(ceph_test_librgw_file_marker spawn)
 install(TARGETS ceph_test_librgw_file_marker DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # ceph_test_librgw_file_xattr (attribute ops)
 add_executable(ceph_test_librgw_file_xattr
-  librgw_file_xattr.cc
-  )
+  librgw_file_xattr.cc)
 target_include_directories(ceph_test_librgw_file_xattr
   PUBLIC "${LUA_INCLUDE_DIR}"
-  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/driver/rados")
 target_link_libraries(ceph_test_librgw_file_xattr
   rgw
   librados
@@ -375,6 +387,7 @@ target_link_libraries(ceph_test_librgw_file_xattr
   ${UNITTEST_LIBS}
   ${EXTRALIBS}
   ${LUA_LIBRARIES}
+  ${ALLOC_LIBS}
   )
 target_link_libraries(ceph_test_librgw_file_xattr spawn)
 
@@ -394,6 +407,9 @@ add_executable(test_rgw_ldap
   ${CMAKE_SOURCE_DIR}/src/rgw/rgw_ldap.cc
   test_rgw_ldap.cc
   )
+target_include_directories(test_rgw_ldap
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/driver/rados")
 target_link_libraries(test_rgw_ldap
   librados
   ceph-common
@@ -438,24 +454,6 @@ install(TARGETS
   ceph_perf_local
   DESTINATION bin)
 
-# ceph_test_filejournal
-add_executable(ceph_test_filejournal
-  test_filejournal.cc
-  )
-target_link_libraries(ceph_test_filejournal
-  os
-  ceph-common
-  ${UNITTEST_LIBS}
-  global
-  ${EXTRALIBS}
-  ${BLKID_LIBRARIES}
-  ${CMAKE_DL_LIBS}
-  ${EXTRALIBS}
-  )
-install(TARGETS
-  ceph_test_filejournal
-  DESTINATION ${CMAKE_INSTALL_BINDIR})
-
 # ceph_test_keys
 add_executable(ceph_test_keys
   testkeys.cc
@@ -485,6 +483,8 @@ install(TARGETS
   ceph_test_stress_watch
   DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# limited Windows signal support, skipped for now
+if(NOT WIN32)
 add_executable(ceph_test_c2c
   test_c2c.cc
   )
@@ -498,6 +498,7 @@ target_link_libraries(ceph_test_c2c
 install(TARGETS
   ceph_test_c2c
   DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif(NOT WIN32)
 
 if(WITH_FUSE)
   add_executable(ceph_test_cfuse_cache_invalidate

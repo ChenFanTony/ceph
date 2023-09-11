@@ -6,6 +6,8 @@
 
 #include "pg_scrubber.h"
 
+using namespace ::std::chrono;
+using namespace ::std::chrono_literals;
 using namespace ::std::literals;
 
 // ////////////////////////////////////////////////////////////////////////// //
@@ -97,7 +99,7 @@ ScrubQueue::ScrubQueue(CephContext* cct, Scrub::ScrubSchedListener& osds)
 std::optional<double> ScrubQueue::update_load_average()
 {
   int hb_interval = conf()->osd_heartbeat_interval;
-  int n_samples = 60 * 24 * 24;
+  int n_samples = std::chrono::duration_cast<seconds>(24h).count();
   if (hb_interval > 1) {
     n_samples /= hb_interval;
     if (n_samples < 1)
@@ -513,7 +515,7 @@ Scrub::schedule_result_t ScrubQueue::select_from_group(
     }
   }
 
-  dout(20) << " returning 'none ready' " << dendl;
+  dout(20) << " returning 'none ready'" << dendl;
   return Scrub::schedule_result_t::none_ready;
 }
 
@@ -558,9 +560,10 @@ ScrubQueue::scrub_schedule_t ScrubQueue::adjust_target_time(
   return sched_n_dead;
 }
 
-double ScrubQueue::scrub_sleep_time(bool must_scrub) const
+std::chrono::milliseconds ScrubQueue::scrub_sleep_time(bool must_scrub) const
 {
-  double regular_sleep_period = conf()->osd_scrub_sleep;
+  std::chrono::milliseconds regular_sleep_period{
+    uint64_t(std::max(0.0, conf()->osd_scrub_sleep) * 1000)};
 
   if (must_scrub || scrub_time_permit(time_now())) {
     return regular_sleep_period;
@@ -568,8 +571,10 @@ double ScrubQueue::scrub_sleep_time(bool must_scrub) const
 
   // relevant if scrubbing started during allowed time, but continued into
   // forbidden hours
-  double extended_sleep = conf()->osd_scrub_extended_sleep;
+  std::chrono::milliseconds extended_sleep{
+    uint64_t(std::max(0.0, conf()->osd_scrub_extended_sleep) * 1000)};
   dout(20) << "w/ extended sleep (" << extended_sleep << ")" << dendl;
+
   return std::max(extended_sleep, regular_sleep_period);
 }
 

@@ -16,12 +16,11 @@ void create_top_metatable(lua_State* L, req_state* s, const char* op_name);
 
 // execute a lua script in the Request context
 int execute(
-    rgw::sal::Store* store,
+    rgw::sal::Driver* driver,
     RGWREST* rest,
     OpsLogSink* olog,
     req_state *s, 
-    const char* op_name,
+    RGWOp* op,
     const std::string& script);
-
 } // namespace rgw::lua::request
 

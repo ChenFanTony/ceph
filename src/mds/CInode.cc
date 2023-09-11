@@ -131,7 +131,7 @@ std::string_view CInode::pin_name(int p) const
 }
 
 //int cinode_pins[CINODE_NUM_PINS];  // counts
-ostream& CInode::print_db_line_prefix(ostream& out)
+ostream& CInode::print_db_line_prefix(ostream& out) const
 {
   return out << ceph_clock_now() << " mds." << mdcache->mds->get_nodeid() << ".cache.ino(" << ino() << ") ";
 }
@@ -338,7 +338,7 @@ CInode::CInode(MDCache *c, bool auth, snapid_t f, snapid_t l) :
     state_set(STATE_AUTH);
 }
 
-void CInode::print(ostream& out)
+void CInode::print(ostream& out) const
 {
   out << *this;
 }
@@ -523,6 +523,10 @@ sr_t *CInode::prepare_new_srnode(snapid_t snapid)
     new_srnode->seq = snapid;
     new_srnode->created = snapid;
     new_srnode->current_parent_since = get_oldest_snap();
+    SnapRealm *sr = find_snaprealm();
+    dout(20) << __func__ << ": inheriting change_attr from " << *sr
+             << dendl;
+    new_srnode->change_attr = sr->srnode.change_attr;
   }
   return new_srnode;
 }
@@ -2212,7 +2216,6 @@ void CInode::decode_lock_state(int type, const bufferlist& bl)
   auto p = bl.cbegin();
 
   DECODE_START(1, p);
-  utime_t tm;
 
   snapid_t newfirst;
   using ceph::decode;
@@ -2406,7 +2409,6 @@ void CInode::finish_scatter_update(ScatterLock *lock, CDir *dir,
       }
 	
       EUpdate *le = new EUpdate(mdlog, ename);
-      mdlog->start_entry(le);
       le->metablob.add_dir_context(dir);
       le->metablob.add_dir(dir, true);
       
@@ -2543,7 +2545,8 @@ void CInode::finish_scatter_gather_update(int type, MutationRef& mut)
       if (touched_mtime)
 	pi->mtime = pi->ctime = pi->dirstat.mtime;
       if (touched_chattr)
-	pi->change_attr = pi->dirstat.change_attr;
+	pi->change_attr++;
+
       dout(20) << " final dirstat " << pi->dirstat << dendl;
 
       if (dirstat_valid && !dirstat.same_sums(pi->dirstat)) {
@@ -3053,6 +3056,7 @@ const CInode::mempool_old_inode& CInode::cow_old_inode(snapid_t follows, bool co
 void CInode::pre_cow_old_inode()
 {
   snapid_t follows = mdcache->get_global_snaprealm()->get_newest_seq();
+  dout(20) << __func__ << " follows " << follows << " on " << *this << dendl;
   if (first <= follows)
     cow_old_inode(follows, true);
 }
@@ -3799,7 +3803,9 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
   dout(20) << " pfile " << pfile << " pauth " << pauth
 	   << " plink " << plink << " pxattr " << pxattr
 	   << " plocal " << plocal
+	   << " mtime " << any_i->mtime
 	   << " ctime " << any_i->ctime
+	   << " change_attr " << any_i->change_attr
 	   << " valid=" << valid << dendl;
 
   // file
@@ -4147,7 +4153,7 @@ void CInode::encode_cap_message(const ref_t<MClientCaps> &m, Capability *cap)
 
   dout(20) << __func__ << " pfile " << pfile
 	   << " pauth " << pauth << " plink " << plink << " pxattr " << pxattr
-	   << " ctime " << i->ctime << dendl;
+	   << " mtime " << i->mtime << " ctime " << i->ctime << " change_attr " << i->change_attr << dendl;
 
   i = pfile ? pi:oi;
   m->set_layout(i->layout);
@@ -4714,6 +4720,10 @@ void CInode::validate_disk_state(CInode::validated_data *results,
         results->backtrace.error_str << "failed to read off disk; see retval";
         // we probably have a new unwritten file!
         // so skip the backtrace scrub for this entry and say that all's well
+        if (in->is_mdsdir()){
+          dout(20) << "forcing backtrace as passed since mdsdir actually doesn't have backtrace" << dendl;
+          results->backtrace.passed = true;
+        }
         if (in->is_dirty_parent()) {
           dout(20) << "forcing backtrace as passed since inode is dirty parent" << dendl;
           results->backtrace.passed = true;

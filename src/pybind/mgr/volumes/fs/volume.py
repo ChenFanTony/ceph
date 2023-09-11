@@ -2,6 +2,7 @@ import json
 import errno
 import logging
 import os
+import mgr_util
 from typing import TYPE_CHECKING
 
 import cephfs
@@ -69,8 +70,6 @@ class VolumeClient(CephfsClient["Module"]):
     def shutdown(self):
         # Overrides CephfsClient.shutdown()
         log.info("shutting down")
-        # first, note that we're shutting down
-        self.stopping.set()
         # stop clones
         self.cloner.shutdown()
         # stop purge threads
@@ -95,14 +94,9 @@ class VolumeClient(CephfsClient["Module"]):
     ### volume operations -- create, rm, ls
 
     def create_fs_volume(self, volname, placement):
-        if self.is_stopping():
-            return -errno.ESHUTDOWN, "", "shutdown in progress"
         return create_volume(self.mgr, volname, placement)
 
     def delete_fs_volume(self, volname, confirm):
-        if self.is_stopping():
-            return -errno.ESHUTDOWN, "", "shutdown in progress"
-
         if confirm != "--yes-i-really-mean-it":
             return -errno.EPERM, "", "WARNING: this will *PERMANENTLY DESTROY* all data " \
                 "stored in the filesystem '{0}'. If you are *ABSOLUTELY CERTAIN* " \
@@ -129,15 +123,10 @@ class VolumeClient(CephfsClient["Module"]):
         return delete_volume(self.mgr, volname, metadata_pool, data_pools)
 
     def list_fs_volumes(self):
-        if self.stopping.is_set():
-            return -errno.ESHUTDOWN, "", "shutdown in progress"
         volumes = list_volumes(self.mgr)
         return 0, json.dumps(volumes, indent=4, sort_keys=True), ""
 
     def rename_fs_volume(self, volname, newvolname, sure):
-        if self.is_stopping():
-            return -errno.ESHUTDOWN, "", "shutdown in progress"
-
         if not sure:
             return (
                 -errno.EPERM, "",
@@ -152,6 +141,7 @@ class VolumeClient(CephfsClient["Module"]):
     def volume_info(self, **kwargs):
         ret     = None
         volname = kwargs['vol_name']
+        human_readable    = kwargs['human_readable']
 
         try:
             with open_volume(self, volname) as fs_handle:
@@ -162,8 +152,11 @@ class VolumeClient(CephfsClient["Module"]):
                                          cephfs.AT_SYMLINK_NOFOLLOW)
 
                     usedbytes = st['size']
-                    vol_info_dict = get_pending_subvol_deletions_count(path)
-                    vol_info_dict['used_size'] = int(usedbytes)
+                    vol_info_dict = get_pending_subvol_deletions_count(fs_handle, path)
+                    if human_readable:
+                        vol_info_dict['used_size'] = mgr_util.format_bytes(int(usedbytes), 5)
+                    else:
+                        vol_info_dict['used_size'] = int(usedbytes)
                 except cephfs.Error as e:
                     if e.args[0] == errno.ENOENT:
                         pass
@@ -178,10 +171,16 @@ class VolumeClient(CephfsClient["Module"]):
                         pool_type = "metadata"
                     else:
                         pool_type = "data"
-                    vol_info_dict["pools"][pool_type].append({
-                                    'name': pools[pool_id]['pool_name'],
-                                    'used': pool_stats[pool_id]['bytes_used'],
-                                    'avail': pool_stats[pool_id]['max_avail']})
+                    if human_readable:
+                        vol_info_dict["pools"][pool_type].append({
+                                        'name': pools[pool_id]['pool_name'],
+                                        'used': mgr_util.format_bytes(pool_stats[pool_id]['bytes_used'], 5),
+                                        'avail': mgr_util.format_bytes(pool_stats[pool_id]['max_avail'], 5)})
+                    else:
+                        vol_info_dict["pools"][pool_type].append({
+                                        'name': pools[pool_id]['pool_name'],
+                                        'used': pool_stats[pool_id]['bytes_used'],
+                                        'avail': pool_stats[pool_id]['max_avail']})
 
                 mon_addr_lst = []
                 mon_map_mons = self.mgr.get('mon_map')['mons']

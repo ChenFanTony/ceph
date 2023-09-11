@@ -134,7 +134,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
   string(PREPEND CMAKE_CXX_FLAGS_DEBUG "-Og ")
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wstrict-null-sentinel>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Woverloaded-virtual>)
-  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-new-ttp-matching>)
   # cmake does not add '-pie' for executables even if
   # CMAKE_POSITION_INDEPENDENT_CODE is TRUE.
   if(EXE_LINKER_USE_PIE)
@@ -185,12 +184,13 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
         -D_FORTIFY_SOURCE=2)
     endif()
   endif()
-  if(NOT WIN32)
     CHECK_C_COMPILER_FLAG(-fstack-protector-strong HAS_STACK_PROTECT)
     if (HAS_STACK_PROTECT)
       add_compile_options(-fstack-protector-strong)
+      if(WIN32)
+        add_link_options(-fstack-protector-strong)
+      endif(WIN32)
     endif()
-  endif(NOT WIN32)
 endif(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
 
 CHECK_C_COMPILER_FLAG("-D_GLIBCXX_ASSERTIONS" HAS_GLIBCXX_ASSERTIONS)
@@ -250,6 +250,12 @@ if(COMPILER_SUPPORTS_DIAGNOSTICS_COLOR)
     "$<$<COMPILE_LANGUAGE:CXX>:-fdiagnostics-color=${DIAGNOSTICS_COLOR}>")
 endif()
 
+if(MINGW)
+  # Fedora and RHEL set CMAKE_DL_LIBS on MINGW, which we must un-set here.
+  # Details at https://bugzilla.redhat.com/show_bug.cgi?id=2127529
+  set(CMAKE_DL_LIBS "")
+endif()
+
 set(EXTRALIBS ${CMAKE_DL_LIBS})
 if(HAVE_POSIX_TIMERS)
   list(APPEND EXTRALIBS ${RT_LIBRARY})
@@ -289,6 +295,10 @@ if(WITH_CEPHFS_JAVA)
   add_subdirectory(java)
 endif()
 
+if(WITH_RADOSGW_D4N)
+  add_subdirectory(cpp_redis)
+endif()
+
 if (WITH_BLKIN)
   add_subdirectory(blkin/blkin-lib)
 endif(WITH_BLKIN)
@@ -306,10 +316,18 @@ list(APPEND mds_files
 add_subdirectory(json_spirit)
 
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/src/xxHash")
-include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/src/rapidjson/include")
+
+# use the rapidjson headers from s3select's submodule
+if(NOT TARGET RapidJSON::RapidJSON)
+  add_library(RapidJSON::RapidJSON INTERFACE IMPORTED)
+  set_target_properties(RapidJSON::RapidJSON PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/s3select/rapidjson/include")
+endif()
 
 option(WITH_FMT_HEADER_ONLY "use header-only version of fmt library" OFF)
-find_package(fmt 7.0.0 QUIET)
+set(WITH_FMT_VERSION "8.1.1" CACHE
+  STRING "build with fmt version")
+find_package(fmt ${WITH_FMT_VERSION} QUIET)
 if(fmt_FOUND)
   include_directories(SYSTEM "${fmt_INCLUDE_DIR}")
 else()
@@ -317,10 +335,11 @@ else()
   set(old_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
   set(BUILD_SHARED_LIBS FALSE)
   add_subdirectory(fmt)
+  if (WITH_FMT_HEADER_ONLY)
+    add_library(fmt::fmt ALIAS fmt-header-only)
+  endif()
   set(BUILD_SHARED_LIBS ${old_BUILD_SHARED_LIBS})
   unset(old_BUILD_SHARED_LIBS)
-  target_compile_definitions(fmt PUBLIC
-    $<$<BOOL:${WIN32}>:FMT_USE_TZSET=0>)
   include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/src/fmt/include")
 endif()
 
@@ -434,6 +453,7 @@ add_subdirectory(common)
 add_subdirectory(crush)
 add_subdirectory(msg)
 add_subdirectory(arch)
+add_subdirectory(extblkdev)
 
 set(ceph_common_objs
   $<TARGET_OBJECTS:common-auth-objs>
@@ -447,7 +467,7 @@ set(ceph_common_objs
   $<TARGET_OBJECTS:common_mountcephfs_objs>
   $<TARGET_OBJECTS:crush_objs>)
 set(ceph_common_deps
-  json_spirit erasure_code arch crc32
+  json_spirit erasure_code extblkdev arch crc32
   ${LIB_RESOLV}
   Boost::thread
   Boost::system
@@ -550,7 +570,7 @@ endif()
 set_target_properties(ceph-common PROPERTIES
   SOVERSION 2
   SKIP_RPATH TRUE)
-if(NOT APPLE AND NOT FREEBSD)
+if(NOT APPLE AND NOT FREEBSD AND NOT WIN32)
   # Apple uses Mach-O, not ELF. so this option does not apply to APPLE.
   #
   # prefer the local symbol definitions when binding references to global
@@ -679,7 +699,7 @@ set(ceph_osd_srcs
   ceph_osd.cc)
 
 add_executable(ceph-osd ${ceph_osd_srcs})
-add_dependencies(ceph-osd erasure_code_plugins)
+add_dependencies(ceph-osd erasure_code_plugins extblkdev_plugins)
 target_link_libraries(ceph-osd osd os global-static common
   ${ALLOC_LIBS}
   ${BLKID_LIBRARIES})
@@ -794,7 +814,8 @@ if(WITH_LIBCEPHFS)
       OUTPUT_NAME cephfs
       VERSION 2.0.0
       SOVERSION 2)
-    if(NOT APPLE)
+    if(NOT APPLE AND NOT
+        (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL Clang))
       foreach(name ceph-common client osdc)
         set_property(TARGET cephfs APPEND_STRING PROPERTY
           LINK_FLAGS " -Wl,--exclude-libs,lib${name}.a")
@@ -878,7 +899,7 @@ if(WITH_KVS)
 endif(WITH_KVS)
 
 if(WITH_RADOSGW)
-  if(WITH_RADOSGW_SELECT_PARQUET)
+  if(WITH_RADOSGW_SELECT_PARQUET OR WITH_RADOSGW_ARROW_FLIGHT)
     if(WITH_SYSTEM_ARROW)
       find_package(Arrow 4 REQUIRED QUIET)
       find_package(Parquet 4 REQUIRED QUIET)
@@ -894,8 +915,8 @@ if(WITH_RADOSGW)
 
       include(BuildArrow)
       build_arrow()
-    endif()
-  endif()
+    endif(WITH_SYSTEM_ARROW)
+  endif(WITH_RADOSGW_SELECT_PARQUET OR WITH_RADOSGW_ARROW_FLIGHT)
 
   add_subdirectory(libkmip)
   add_subdirectory(rgw)

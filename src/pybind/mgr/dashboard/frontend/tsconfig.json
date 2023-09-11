@@ -17,9 +17,10 @@
     "noImplicitReturns": true,
     "noImplicitAny": true,
     "suppressImplicitAnyIndexErrors": true,
-    "target": "es2015",
+    "target": "es2020",
     "module": "es2020",
     "baseUrl": "./",
+    "resolveJsonModule": true,
     "paths": {
       "~/*": ["src/*"]
     },

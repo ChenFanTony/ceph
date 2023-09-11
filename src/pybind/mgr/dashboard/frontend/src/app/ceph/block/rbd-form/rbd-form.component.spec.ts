@@ -142,7 +142,6 @@ describe('RbdFormComponent', () => {
       expect(component['rbdImage'].observers.length).toEqual(0);
       component.ngOnInit(); // Subscribes to image once during init
       component.submit();
-      expect(component['rbdImage'].observers.length).toEqual(1);
       expect(createAction).toHaveBeenCalledTimes(0);
       expect(editAction).toHaveBeenCalledTimes(1);
       expect(cloneAction).toHaveBeenCalledTimes(0);
@@ -452,10 +451,33 @@ describe('RbdFormComponent', () => {
 
       it('should set and disable exclusive-lock only for the journal mode', () => {
         component.poolMirrorMode = 'pool';
+        component.mirroring = true;
+        const journal = fixture.debugElement.query(By.css('#journal')).nativeElement;
+        journal.click();
         fixture.detectChanges();
         const exclusiveLocks = fixture.debugElement.query(By.css('#exclusive-lock')).nativeElement;
         expect(exclusiveLocks.checked).toBe(true);
         expect(exclusiveLocks.disabled).toBe(true);
+      });
+
+      it('should have journaling feature for journaling mirror mode on createRequest', () => {
+        component.mirroring = true;
+        fixture.detectChanges();
+        const journal = fixture.debugElement.query(By.css('#journal')).nativeElement;
+        journal.click();
+        expect(journal.checked).toBe(true);
+        const request = component.createRequest();
+        expect(request.features).toContain('journaling');
+      });
+
+      it('should have journaling feature for journaling mirror mode on editRequest', () => {
+        component.mirroring = true;
+        fixture.detectChanges();
+        const journal = fixture.debugElement.query(By.css('#journal')).nativeElement;
+        journal.click();
+        expect(journal.checked).toBe(true);
+        const request = component.editRequest();
+        expect(request.features).toContain('journaling');
       });
     });
   });

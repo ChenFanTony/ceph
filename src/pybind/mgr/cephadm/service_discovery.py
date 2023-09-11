@@ -7,14 +7,18 @@ except ImportError:
         pass
 
 import logging
-import tempfile
-from typing import Dict, List, TYPE_CHECKING, cast, Collection
+import socket
 
-from orchestrator import OrchestratorError
+import orchestrator  # noqa
 from mgr_module import ServiceInfoT
-from mgr_util import verify_tls_files, build_url
+from mgr_util import build_url
+from typing import Dict, List, TYPE_CHECKING, cast, Collection, Callable, NamedTuple, Optional
+from cephadm.services.monitoring import AlertmanagerService, NodeExporterService, PrometheusService
+import secrets
+
 from cephadm.services.ingress import IngressSpec
 from cephadm.ssl_cert_utils import SSLCerts
+from cephadm.services.cephadmservice import CephExporterService
 
 if TYPE_CHECKING:
     from cephadm.module import CephadmOrchestrator
@@ -32,6 +36,12 @@ logging.getLogger('cherrypy.error').addFilter(cherrypy_filter)
 cherrypy.log.access_log.propagate = False
 
 
+class Route(NamedTuple):
+    name: str
+    route: str
+    controller: Callable
+
+
 class ServiceDiscovery:
 
     KV_STORE_SD_ROOT_CERT = 'service_discovery/root/cert'
@@ -40,52 +50,66 @@ class ServiceDiscovery:
     def __init__(self, mgr: "CephadmOrchestrator") -> None:
         self.mgr = mgr
         self.ssl_certs = SSLCerts()
-        self.server_port = self.mgr.service_discovery_port
-        self.server_addr = '::'
+        self.username: Optional[str] = None
+        self.password: Optional[str] = None
 
-    def configure_routes(self) -> None:
+    def validate_password(self, realm: str, username: str, password: str) -> bool:
+        return (password == self.password and username == self.username)
 
-        root_server = Root(self.mgr,
-                           self.server_port,
-                           self.server_addr,
-                           self.cert_file.name,
-                           self.key_file.name)
-
-        # configure routes
+    def configure_routes(self, server: Server, enable_auth: bool) -> None:
+        ROUTES = [
+            Route('index', '/', server.index),
+            Route('sd-config', '/prometheus/sd-config', server.get_sd_config),
+            Route('rules', '/prometheus/rules', server.get_prometheus_rules),
+        ]
         d = cherrypy.dispatch.RoutesDispatcher()
-        d.connect(name='index', route='/', controller=root_server.index)
-        d.connect(name='index', route='/sd', controller=root_server.index)
-        d.connect(name='index', route='/sd/', controller=root_server.index)
-        d.connect(name='sd-config', route='/sd/prometheus/sd-config',
-                  controller=root_server.get_sd_config)
-        d.connect(name='rules', route='/sd/prometheus/rules',
-                  controller=root_server.get_prometheus_rules)
-        cherrypy.tree.mount(None, '/', config={'/': {'request.dispatch': d}})
+        for route in ROUTES:
+            d.connect(**route._asdict())
+        if enable_auth:
+            conf = {
+                '/': {
+                    'request.dispatch': d,
+                    'tools.auth_basic.on': True,
+                    'tools.auth_basic.realm': 'localhost',
+                    'tools.auth_basic.checkpassword': self.validate_password
+                }
+            }
+        else:
+            conf = {'/': {'request.dispatch': d}}
+        cherrypy.tree.mount(None, '/sd', config=conf)
 
-    def configure_tls(self) -> None:
-        try:
-            old_cert = self.mgr.get_store(self.KV_STORE_SD_ROOT_CERT)
-            old_key = self.mgr.get_store(self.KV_STORE_SD_ROOT_KEY)
-            if not old_key or not old_cert:
-                raise OrchestratorError('No old credentials for service discovery found')
+    def enable_auth(self) -> None:
+        self.username = self.mgr.get_store('service_discovery/root/username')
+        self.password = self.mgr.get_store('service_discovery/root/password')
+        if not self.password or not self.username:
+            self.username = 'admin'  # TODO(redo): what should be the default username
+            self.password = secrets.token_urlsafe(20)
+            self.mgr.set_store('service_discovery/root/password', self.password)
+            self.mgr.set_store('service_discovery/root/username', self.username)
+
+    def configure_tls(self, server: Server) -> None:
+        old_cert = self.mgr.get_store(self.KV_STORE_SD_ROOT_CERT)
+        old_key = self.mgr.get_store(self.KV_STORE_SD_ROOT_KEY)
+        if old_key and old_cert:
             self.ssl_certs.load_root_credentials(old_cert, old_key)
-        except (OrchestratorError, KeyError, ValueError):
+        else:
             self.ssl_certs.generate_root_cert(self.mgr.get_mgr_ip())
             self.mgr.set_store(self.KV_STORE_SD_ROOT_CERT, self.ssl_certs.get_root_cert())
             self.mgr.set_store(self.KV_STORE_SD_ROOT_KEY, self.ssl_certs.get_root_key())
+        addr = self.mgr.get_mgr_ip()
+        host_fqdn = socket.getfqdn(addr)
+        server.ssl_certificate, server.ssl_private_key = self.ssl_certs.generate_cert_files(
+            host_fqdn, addr)
 
-        cert, key = self.ssl_certs.generate_cert(self.mgr.get_mgr_ip())
-        self.key_file = tempfile.NamedTemporaryFile()
-        self.key_file.write(key.encode('utf-8'))
-        self.key_file.flush()  # pkey_tmp must not be gc'ed
-        self.cert_file = tempfile.NamedTemporaryFile()
-        self.cert_file.write(cert.encode('utf-8'))
-        self.cert_file.flush()  # cert_tmp must not be gc'ed
-        verify_tls_files(self.cert_file.name, self.key_file.name)
-
-    def configure(self) -> None:
-        self.configure_tls()
-        self.configure_routes()
+    def configure(self, port: int, addr: str, enable_security: bool) -> None:
+        # we create a new server to enforce TLS/SSL config refresh
+        self.root_server = Root(self.mgr, port, addr)
+        self.root_server.ssl_certificate = None
+        self.root_server.ssl_private_key = None
+        if enable_security:
+            self.enable_auth()
+            self.configure_tls(self.root_server)
+        self.configure_routes(self.root_server, enable_security)
 
 
 class Root(Server):
@@ -95,17 +119,18 @@ class Root(Server):
         cherrypy.request.path = ''
         return self
 
-    def __init__(self, mgr: "CephadmOrchestrator",
-                 port: int = 0,
-                 host: str = '',
-                 ssl_ca_cert: str = '',
-                 ssl_priv_key: str = ''):
+    def stop(self) -> None:
+        # we must call unsubscribe before stopping the server,
+        # otherwise the port is not released and we will get
+        # an exception when trying to restart it
+        self.unsubscribe()
+        super().stop()
+
+    def __init__(self, mgr: "CephadmOrchestrator", port: int = 0, host: str = ''):
         self.mgr = mgr
         super().__init__()
         self.socket_port = port
-        self._socket_host = host
-        self.ssl_certificate = ssl_ca_cert
-        self.ssl_private_key = ssl_priv_key
+        self.socket_host = host
         self.subscribe()
 
     @cherrypy.expose
@@ -119,6 +144,7 @@ class Root(Server):
 <p><a href='prometheus/sd-config?service=alertmanager'>Alertmanager http sd-config</a></p>
 <p><a href='prometheus/sd-config?service=node-exporter'>Node exporter http sd-config</a></p>
 <p><a href='prometheus/sd-config?service=haproxy'>HAProxy http sd-config</a></p>
+<p><a href='prometheus/sd-config?service=ceph-exporter'>Ceph exporter http sd-config</a></p>
 <p><a href='prometheus/rules'>Prometheus rules</a></p>
 </body>
 </html>'''
@@ -135,6 +161,8 @@ class Root(Server):
             return self.node_exporter_sd_config()
         elif service == 'haproxy':
             return self.haproxy_sd_config()
+        elif service == 'ceph-exporter':
+            return self.ceph_exporter_sd_config()
         else:
             return []
 
@@ -145,9 +173,10 @@ class Root(Server):
         for server in servers:
             hostname = server.get('hostname', '')
             for service in cast(List[ServiceInfoT], server.get('services', [])):
-                if service['type'] != 'mgr':
+                if service['type'] != 'mgr' or service['id'] != self.mgr.get_mgr_id():
                     continue
-                port = self.mgr.get_module_option_ex('prometheus', 'server_port', 9283)
+                port = self.mgr.get_module_option_ex(
+                    'prometheus', 'server_port', PrometheusService.DEFAULT_MGR_PROMETHEUS_PORT)
                 targets.append(f'{hostname}:{port}')
         return [{"targets": targets, "labels": {}}]
 
@@ -157,7 +186,7 @@ class Root(Server):
         for dd in self.mgr.cache.get_daemons_by_service('alertmanager'):
             assert dd.hostname is not None
             addr = dd.ip if dd.ip else self.mgr.inventory.get_addr(dd.hostname)
-            port = dd.ports[0] if dd.ports else 9093
+            port = dd.ports[0] if dd.ports else AlertmanagerService.DEFAULT_SERVICE_PORT
             srv_entries.append('{}'.format(build_url(host=addr, port=port).lstrip('/')))
         return [{"targets": srv_entries, "labels": {}}]
 
@@ -167,7 +196,7 @@ class Root(Server):
         for dd in self.mgr.cache.get_daemons_by_service('node-exporter'):
             assert dd.hostname is not None
             addr = dd.ip if dd.ip else self.mgr.inventory.get_addr(dd.hostname)
-            port = dd.ports[0] if dd.ports else 9100
+            port = dd.ports[0] if dd.ports else NodeExporterService.DEFAULT_SERVICE_PORT
             srv_entries.append({
                 'targets': [build_url(host=addr, port=port).lstrip('/')],
                 'labels': {'instance': dd.hostname}
@@ -187,6 +216,19 @@ class Root(Server):
                         'targets': [f"{build_url(host=addr, port=spec.monitor_port).lstrip('/')}"],
                         'labels': {'instance': dd.service_name()}
                     })
+        return srv_entries
+
+    def ceph_exporter_sd_config(self) -> List[Dict[str, Collection[str]]]:
+        """Return <http_sd_config> compatible prometheus config for ceph-exporter service."""
+        srv_entries = []
+        for dd in self.mgr.cache.get_daemons_by_service('ceph-exporter'):
+            assert dd.hostname is not None
+            addr = dd.ip if dd.ip else self.mgr.inventory.get_addr(dd.hostname)
+            port = dd.ports[0] if dd.ports else CephExporterService.DEFAULT_SERVICE_PORT
+            srv_entries.append({
+                'targets': [build_url(host=addr, port=port).lstrip('/')],
+                'labels': {'instance': dd.hostname}
+            })
         return srv_entries
 
     @cherrypy.expose(alias='prometheus/rules')

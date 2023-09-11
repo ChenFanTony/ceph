@@ -56,6 +56,20 @@ void rgw_zone_set_entry::decode_json(JSONObj *obj) {
   JSONDecoder::decode_json("entry", s, obj);
   from_str(s);
 }
+void rgw_zone_set::dump(Formatter *f) const
+{
+  encode_json("entries", entries, f);
+}
+
+void rgw_zone_set::generate_test_instances(list<rgw_zone_set*>& o)
+{
+  o.push_back(new rgw_zone_set);
+  o.push_back(new rgw_zone_set);
+  std::optional<string> loc_key = "loc_key";
+  o.back()->insert("zone1", loc_key);
+  o.back()->insert("zone2", loc_key);
+  o.back()->insert("zone3", loc_key);
+}
 
 void rgw_zone_set::insert(const string& zone, std::optional<string> location_key)
 {
@@ -857,4 +871,22 @@ void cls_rgw_lc_obj_head::dump(Formatter *f) const
 
 void cls_rgw_lc_obj_head::generate_test_instances(list<cls_rgw_lc_obj_head*>& ls)
 {
+}
+
+std::ostream& operator<<(std::ostream& out, cls_rgw_reshard_status status) {
+  switch (status) {
+  case cls_rgw_reshard_status::NOT_RESHARDING:
+    out << "NOT_RESHARDING";
+    break;
+  case cls_rgw_reshard_status::IN_PROGRESS:
+    out << "IN_PROGRESS";
+    break;
+  case cls_rgw_reshard_status::DONE:
+    out << "DONE";
+    break;
+  default:
+    out << "UNKNOWN_STATUS";
+  }
+
+  return out;
 }

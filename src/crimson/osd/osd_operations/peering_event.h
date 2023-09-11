@@ -8,7 +8,6 @@
 
 #include "crimson/osd/osdmap_gate.h"
 #include "crimson/osd/osd_operation.h"
-#include "crimson/osd/osd_operations/background_recovery.h"
 #include "osd/osd_types.h"
 #include "osd/PGPeeringEvent.h"
 #include "osd/PeeringState.h"
@@ -22,6 +21,7 @@ namespace crimson::osd {
 class OSD;
 class ShardServices;
 class PG;
+class BackfillRecovery;
 
   class PGPeeringPipeline {
     struct AwaitMap : OrderedExclusivePhaseT<AwaitMap> {
@@ -35,6 +35,7 @@ class PG;
     friend class LocalPeeringEvent;
     friend class RemotePeeringEvent;
     friend class PGAdvanceMap;
+    friend class BackfillRecovery;
   };
 
 template <class T>
@@ -50,7 +51,7 @@ public:
   static constexpr OperationTypeCode type = OperationTypeCode::peering_event;
 
 protected:
-  PGPeeringPipeline &pp(PG &pg);
+  PGPeeringPipeline &peering_pp(PG &pg);
 
   PeeringCtx ctx;
   pg_shard_t from;
@@ -133,11 +134,6 @@ public:
     conn(conn)
   {}
 
-#if 0
-  std::tuple<
-  > tracking_events;
-#endif
-
   std::tuple<
     StartEvent,
     ConnectionPipeline::AwaitActive::BlockingEvent,
@@ -148,16 +144,7 @@ public:
     PGPeeringPipeline::AwaitMap::BlockingEvent,
     PG_OSDMapGate::OSDMapBlocker::BlockingEvent,
     PGPeeringPipeline::Process::BlockingEvent,
-    BackfillRecovery::BackfillRecoveryPipeline::Process::BlockingEvent,
     OSDPipeline::AwaitActive::BlockingEvent,
-#if 0
-    PGPipeline::WaitForActive::BlockingEvent,
-    PGActivationBlocker::BlockingEvent,
-    PGPipeline::RecoverMissing::BlockingEvent,
-    PGPipeline::GetOBC::BlockingEvent,
-    PGPipeline::WaitRepop::BlockingEvent,
-    PGPipeline::SendReply::BlockingEvent,
-#endif
     CompletionEvent
   > tracking_events;
 
@@ -166,9 +153,22 @@ public:
   spg_t get_pgid() const {
     return pgid;
   }
-  ConnectionPipeline &get_connection_pipeline();
   PipelineHandle &get_handle() { return handle; }
   epoch_t get_epoch() const { return evt.get_epoch_sent(); }
+
+  ConnectionPipeline &get_connection_pipeline();
+  seastar::future<crimson::net::ConnectionFRef> prepare_remote_submission() {
+    assert(conn);
+    return conn.get_foreign(
+    ).then([this](auto f_conn) {
+      conn.reset();
+      return f_conn;
+    });
+  }
+  void finish_remote_submission(crimson::net::ConnectionFRef _conn) {
+    assert(!conn);
+    conn = make_local_shared_foreign(std::move(_conn));
+  }
 };
 
 class LocalPeeringEvent final : public PeeringEvent<LocalPeeringEvent> {
@@ -193,18 +193,15 @@ public:
     PGPeeringPipeline::AwaitMap::BlockingEvent,
     PG_OSDMapGate::OSDMapBlocker::BlockingEvent,
     PGPeeringPipeline::Process::BlockingEvent,
-    BackfillRecovery::BackfillRecoveryPipeline::Process::BlockingEvent,
-#if 0
-    PGPipeline::WaitForActive::BlockingEvent,
-    PGActivationBlocker::BlockingEvent,
-    PGPipeline::RecoverMissing::BlockingEvent,
-    PGPipeline::GetOBC::BlockingEvent,
-    PGPipeline::WaitRepop::BlockingEvent,
-    PGPipeline::SendReply::BlockingEvent,
-#endif
     CompletionEvent
   > tracking_events;
 };
 
 
 }
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<crimson::osd::LocalPeeringEvent> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::osd::RemotePeeringEvent> : fmt::ostream_formatter {};
+template <class T> struct fmt::formatter<crimson::osd::PeeringEvent<T>> : fmt::ostream_formatter {};
+#endif

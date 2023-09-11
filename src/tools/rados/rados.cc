@@ -91,7 +91,7 @@ void usage(ostream& out)
 "   lspools                          list pools\n"
 "   cppool <pool-name> <dest-pool>   copy content of a pool\n"
 "   purge <pool-name> --yes-i-really-really-mean-it\n"
-"                                    remove all objects from pool <pool-name> without removing it\n"
+"                                    remove all objects from pool <pool-name> without removing the pool itself\n"
 "   df                               show per-pool and total usage\n"
 "   ls                               list objects in pool\n\n"
 "\n"
@@ -3118,7 +3118,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
     }
 
     cerr << "WARNING: pool copy does not preserve user_version, which some "
-	 << "    apps may rely on." << std::endl;
+	 << "apps may rely on." << std::endl;
 
     if (rados.get_pool_is_selfmanaged_snaps_mode(src_pool)) {
       cerr << "WARNING: pool " << src_pool << " has selfmanaged snaps, which are not preserved\n"

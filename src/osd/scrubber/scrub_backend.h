@@ -183,20 +183,20 @@ struct fmt::formatter<shard_as_auth_t> {
       // note: 'if' chain, as hard to consistently (on all compilers) avoid some
       // warnings for a switch plus multiple return paths
       if (as_auth.possible_auth == shard_as_auth_t::usable_t::not_usable) {
-        return format_to(ctx.out(),
-                         "{{shard-not-usable:{}}}",
-                         as_auth.error_text);
+        return fmt::format_to(ctx.out(),
+                              "{{shard-not-usable:{}}}",
+                              as_auth.error_text);
       }
       if (as_auth.possible_auth == shard_as_auth_t::usable_t::not_found) {
-        return format_to(ctx.out(), "{{shard-not-found}}");
+        return fmt::format_to(ctx.out(), "{{shard-not-found}}");
       }
-      return format_to(ctx.out(),
-                       "{{shard-usable: soid:{} {{txt:{}}} }}",
-                       as_auth.oi.soid,
-                       as_auth.error_text);
+      return fmt::format_to(ctx.out(),
+                            "{{shard-usable: soid:{} {{txt:{}}} }}",
+                            as_auth.oi.soid,
+                            as_auth.error_text);
 
     } else {
-      return format_to(
+      return fmt::format_to(
         ctx.out(),
         "usable:{} soid:{} {{txt:{}}}",
         (as_auth.possible_auth == shard_as_auth_t::usable_t::usable) ? "yes"
@@ -544,7 +544,7 @@ struct fmt::formatter<std::pair<hobject_t, data_omap_digests_t>> {
 
   template <typename FormatContext>
   auto format(const std::pair<hobject_t, data_omap_digests_t>& x,
-	      FormatContext& ctx)
+	      FormatContext& ctx) const
   {
     return fmt::format_to(ctx.out(),
 			  "{{ {} - {} }}",

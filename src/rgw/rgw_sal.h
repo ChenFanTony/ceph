@@ -35,6 +35,8 @@ class RGWDataSyncStatusManager;
 class RGWSyncModuleInstance;
 typedef std::shared_ptr<RGWSyncModuleInstance> RGWSyncModuleInstanceRef;
 class RGWCompressionInfo;
+struct rgw_pubsub_topics;
+struct rgw_pubsub_bucket_topics;
 
 
 using RGWBucketListNameFilter = std::function<bool (const std::string&)>;
@@ -244,62 +246,54 @@ class ObjectProcessor : public DataProcessor {
                        optional_yield y) = 0;
 };
 
-/** Base class for AIO completions */
-class Completions {
-  public:
-    Completions() {}
-    virtual ~Completions() = default;
-    virtual int drain() = 0;
-};
-
 /** A list of key-value attributes */
   using Attrs = std::map<std::string, ceph::buffer::list>;
 
 /**
  * @brief Base singleton representing a Store or Filter
  *
- * The Store is the base abstraction of the SAL layer.  It represents a base storage
+ * The Driver is the base abstraction of the SAL layer.  It represents a base storage
  * mechanism, or a intermediate stacking layer.  There is a single instance of a given
- * Store per RGW, and this Store mediates all access to it's backing.
+ * Driver per RGW, and this Driver mediates all access to it's backing.
  *
- * A store contains, loosely, @a User, @a Bucket, and @a Object entities.  The @a Object
+ * A Driver contains, loosely, @a User, @a Bucket, and @a Object entities.  The @a Object
  * contains data, and it's associated metadata.  The @a Bucket contains Objects, and
  * metadata about the bucket.  Both Buckets and Objects are owned by a @a User, which is
  * the basic unit of access control.
  *
- * A store also has metadata and some global responsibilities.  For example, a store is
+ * A Driver also has metadata and some global responsibilities.  For example, a driver is
  * responsible for managing the LifeCycle activities for it's data.
  */
-class Store {
+class Driver {
   public:
-    Store() {}
-    virtual ~Store() = default;
+    Driver() {}
+    virtual ~Driver() = default;
 
-    /** Post-creation initialization of store */
+    /** Post-creation initialization of driver */
     virtual int initialize(CephContext *cct, const DoutPrefixProvider *dpp) = 0;
-    /** Name of this store provider (e.g., "rados") */
+    /** Name of this driver provider (e.g., "rados") */
     virtual const std::string get_name() const = 0;
     /** Get cluster unique identifier */
     virtual std::string get_cluster_id(const DoutPrefixProvider* dpp,  optional_yield y) = 0;
-    /** Get a User from a rgw_user.  Does not query store for user info, so quick */
+    /** Get a User from a rgw_user.  Does not query driver for user info, so quick */
     virtual std::unique_ptr<User> get_user(const rgw_user& u) = 0;
-    /** Lookup a User by access key.  Queries store for user info. */
+    /** Lookup a User by access key.  Queries driver for user info. */
     virtual int get_user_by_access_key(const DoutPrefixProvider* dpp, const std::string& key, optional_yield y, std::unique_ptr<User>* user) = 0;
-    /** Lookup a User by email address.  Queries store for user info. */
+    /** Lookup a User by email address.  Queries driver for user info. */
     virtual int get_user_by_email(const DoutPrefixProvider* dpp, const std::string& email, optional_yield y, std::unique_ptr<User>* user) = 0;
-    /** Lookup a User by swift username.  Queries store for user info. */
+    /** Lookup a User by swift username.  Queries driver for user info. */
     virtual int get_user_by_swift(const DoutPrefixProvider* dpp, const std::string& user_str, optional_yield y, std::unique_ptr<User>* user) = 0;
     /** Get a basic Object.  This Object is not looked up, and is incomplete, since is
      * does not have a bucket.  This should only be used when an Object is needed before
      * there is a Bucket, otherwise use the get_object() in the Bucket class. */
     virtual std::unique_ptr<Object> get_object(const rgw_obj_key& k) = 0;
-    /** Get a Bucket by info.  Does not query the store, just uses the give bucket info. */
+    /** Get a Bucket by info.  Does not query the driver, just uses the give bucket info. */
     virtual int get_bucket(User* u, const RGWBucketInfo& i, std::unique_ptr<Bucket>* bucket) = 0;
-    /** Lookup a Bucket by key.  Queries store for bucket info. */
+    /** Lookup a Bucket by key.  Queries driver for bucket info. */
     virtual int get_bucket(const DoutPrefixProvider* dpp, User* u, const rgw_bucket& b, std::unique_ptr<Bucket>* bucket, optional_yield y) = 0;
-    /** Lookup a Bucket by name.  Queries store for bucket info. */
+    /** Lookup a Bucket by name.  Queries driver for bucket info. */
     virtual int get_bucket(const DoutPrefixProvider* dpp, User* u, const std::string& tenant, const std::string& name, std::unique_ptr<Bucket>* bucket, optional_yield y) = 0;
-    /** For multisite, this Store is the zone's master */
+    /** For multisite, this driver is the zone's master */
     virtual bool is_meta_master() = 0;
     /** For multisite, forward an OP to the zone's master */
     virtual int forward_request_to_master(const DoutPrefixProvider *dpp, User* user, obj_version* objv,
@@ -309,7 +303,7 @@ class Store {
 					     bufferlist& in_data,
 					     RGWXMLDecoder::XMLParser* parser, req_info& info,
 					     optional_yield y) = 0;
-    /** Get zone info for this store */
+    /** Get zone info for this driver */
     virtual Zone* get_zone() = 0;
     /** Get a unique ID specific to this zone. */
     virtual std::string zone_unique_id(uint64_t unique_num) = 0;
@@ -319,35 +313,41 @@ class Store {
     virtual int get_zonegroup(const std::string& id, std::unique_ptr<ZoneGroup>* zonegroup) = 0;
     /** List all zones in all zone groups by ID */
     virtual int list_all_zones(const DoutPrefixProvider* dpp, std::list<std::string>& zone_ids) = 0;
-    /** Get statistics about the cluster represented by this Store */
+    /** Get statistics about the cluster represented by this driver */
     virtual int cluster_stat(RGWClusterStat& stats) = 0;
     /** Get a @a Lifecycle object. Used to manage/run lifecycle transitions */
     virtual std::unique_ptr<Lifecycle> get_lifecycle(void) = 0;
-    /** Get a @a Completions object.  Used for Async I/O tracking */
-    virtual std::unique_ptr<Completions> get_completions(void) = 0;
 
      /** Get a @a Notification object.  Used to communicate with non-RGW daemons, such as
       * management/tracking software */
     /** RGWOp variant */
     virtual std::unique_ptr<Notification> get_notification(rgw::sal::Object* obj, rgw::sal::Object* src_obj, req_state* s,
-        rgw::notify::EventType event_type, const std::string* object_name=nullptr) = 0;
+        rgw::notify::EventType event_type, optional_yield y, const std::string* object_name=nullptr) = 0;
     /** No-req_state variant (e.g., rgwlc) */
     virtual std::unique_ptr<Notification> get_notification(
-    const DoutPrefixProvider* dpp, rgw::sal::Object* obj, rgw::sal::Object* src_obj, 
+    const DoutPrefixProvider* dpp, rgw::sal::Object* obj, rgw::sal::Object* src_obj,
     rgw::notify::EventType event_type, rgw::sal::Bucket* _bucket, std::string& _user_id, std::string& _user_tenant,
     std::string& _req_id, optional_yield y) = 0;
-
+    /** Read the topic config entry into @a data and (optionally) @a objv_tracker */
+    virtual int read_topics(const std::string& tenant, rgw_pubsub_topics& topics, RGWObjVersionTracker* objv_tracker,
+        optional_yield y, const DoutPrefixProvider *dpp) = 0;
+    /** Write @a info and (optionally) @a objv_tracker into the config */
+    virtual int write_topics(const std::string& tenant, const rgw_pubsub_topics& topics, RGWObjVersionTracker* objv_tracker,
+        optional_yield y, const DoutPrefixProvider *dpp) = 0;
+    /** Remove the topic config, optionally a specific version */
+    virtual int remove_topics(const std::string& tenant, RGWObjVersionTracker* objv_tracker,
+        optional_yield y,const DoutPrefixProvider *dpp) = 0;
     /** Get access to the lifecycle management thread */
     virtual RGWLC* get_rgwlc(void) = 0;
     /** Get access to the coroutine registry.  Used to create new coroutine managers */
     virtual RGWCoroutinesManagerRegistry* get_cr_registry() = 0;
 
-    /** Log usage data to the store.  Usage data is things like bytes sent/received and
+    /** Log usage data to the driver.  Usage data is things like bytes sent/received and
      * op count */
-    virtual int log_usage(const DoutPrefixProvider *dpp, std::map<rgw_user_bucket, RGWUsageBatch>& usage_info) = 0;
-    /** Log OP data to the store.  Data is opaque to SAL */
+    virtual int log_usage(const DoutPrefixProvider *dpp, std::map<rgw_user_bucket, RGWUsageBatch>& usage_info, optional_yield y) = 0;
+    /** Log OP data to the driver.  Data is opaque to SAL */
     virtual int log_op(const DoutPrefixProvider *dpp, std::string& oid, bufferlist& bl) = 0;
-    /** Register this Store to the service map.  Somewhat Rados specific; may be removed*/
+    /** Register this driver to the service map.  Somewhat Rados specific; may be removed*/
     virtual int register_to_service_map(const DoutPrefixProvider *dpp, const std::string& daemon_type,
 					const std::map<std::string, std::string>& meta) = 0;
     /** Get default quota info.  Used as fallback if a user or bucket has no quota set*/
@@ -355,7 +355,7 @@ class Store {
     /** Get global rate limit configuration*/
     virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit) = 0;
     /** Enable or disable a set of bucket.  e.g. if a User is suspended */
-    virtual int set_buckets_enabled(const DoutPrefixProvider* dpp, std::vector<rgw_bucket>& buckets, bool enabled) = 0;
+    virtual int set_buckets_enabled(const DoutPrefixProvider* dpp, std::vector<rgw_bucket>& buckets, bool enabled, optional_yield y) = 0;
     /** Get a new request ID */
     virtual uint64_t get_new_req_id() = 0;
     /** Get a handler for bucket sync policy. */
@@ -371,14 +371,14 @@ class Store {
     /** Wake up sync threads for bucket data sync */
     virtual void wakeup_data_sync_shards(const DoutPrefixProvider *dpp, const rgw_zone_id& source_zone, boost::container::flat_map<int, boost::container::flat_set<rgw_data_notify_entry>>& shard_ids) = 0;
     /** Clear all usage statistics globally */
-    virtual int clear_usage(const DoutPrefixProvider *dpp) = 0;
+    virtual int clear_usage(const DoutPrefixProvider *dpp, optional_yield y) = 0;
     /** Get usage statistics for all users and buckets */
     virtual int read_all_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch,
 			       uint32_t max_entries, bool* is_truncated,
 			       RGWUsageIter& usage_iter,
 			       std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) = 0;
     /** Trim usage log for all users and buckets */
-    virtual int trim_all_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch) = 0;
+    virtual int trim_all_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch, optional_yield y) = 0;
     /** Get a configuration value for the given name */
     virtual int get_config_key_val(std::string name, bufferlist* bl) = 0;
     /** Start a metadata listing of the given section */
@@ -418,11 +418,11 @@ class Store {
     /** Get all Open ID Connector providers, optionally filtered by tenant  */
     virtual int get_oidc_providers(const DoutPrefixProvider *dpp,
 				   const std::string& tenant,
-				   std::vector<std::unique_ptr<RGWOIDCProvider>>& providers) = 0;
+				   std::vector<std::unique_ptr<RGWOIDCProvider>>& providers, optional_yield y) = 0;
     /** Get a Writer that appends to an object */
     virtual std::unique_ptr<Writer> get_append_writer(const DoutPrefixProvider *dpp,
 				  optional_yield y,
-				  std::unique_ptr<rgw::sal::Object> _head_obj,
+				  rgw::sal::Object* obj,
 				  const rgw_user& owner,
 				  const rgw_placement_rule *ptail_placement_rule,
 				  const std::string& unique_tag,
@@ -431,7 +431,7 @@ class Store {
     /** Get a Writer that atomically writes an entire object */
     virtual std::unique_ptr<Writer> get_atomic_writer(const DoutPrefixProvider *dpp,
 				  optional_yield y,
-				  std::unique_ptr<rgw::sal::Object> _head_obj,
+				  rgw::sal::Object* obj,
 				  const rgw_user& owner,
 				  const rgw_placement_rule *ptail_placement_rule,
 				  uint64_t olh_epoch,
@@ -442,17 +442,13 @@ class Store {
     /** Check to see if this placement rule is valid */
     virtual bool valid_placement(const rgw_placement_rule& rule) = 0;
 
-    /** Clean up a store for termination */
+    /** Clean up a driver for termination */
     virtual void finalize(void) = 0;
 
-    /** Get the Ceph context associated with this store.  May be removed. */
+    /** Get the Ceph context associated with this driver.  May be removed. */
     virtual CephContext* ctx(void) = 0;
 
-    /** Get the location of where lua packages are installed */
-    virtual const std::string& get_luarocks_path() const = 0;
-    /** Set the location of where lua packages are installed */
-    virtual void set_luarocks_path(const std::string& path) = 0;
-    /** Register admin APIs unique to this store */
+    /** Register admin APIs unique to this driver */
     virtual void register_admin_apis(RGWRESTMgr* mgr) = 0;
 };
 
@@ -513,6 +509,10 @@ class User {
     virtual uint32_t get_type() const = 0;
     /** Get the maximum number of buckets allowed for this User */
     virtual int32_t get_max_buckets() const = 0;
+    /** Set the maximum number of buckets allowed for this User */
+    virtual void set_max_buckets(int32_t _max_buckets) = 0;
+    /** Set quota info */
+    virtual void set_info(RGWQuotaInfo& _quota) = 0;
     /** Get the capabilities for this User */
     virtual const RGWUserCaps& get_caps() const = 0;
     /** Get the version tracker for this User */
@@ -547,7 +547,7 @@ class User {
 			   bool* is_truncated, RGWUsageIter& usage_iter,
 			   std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) = 0;
     /** Trim User usage stats to the given epoch range */
-    virtual int trim_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch) = 0;
+    virtual int trim_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch, optional_yield y) = 0;
 
     /** Load this User from the backing store.  requires ID to be set, fills all other fields. */
     virtual int load_user(const DoutPrefixProvider* dpp, optional_yield y) = 0;
@@ -677,13 +677,14 @@ class Bucket {
     /** Sync this bucket's stats to the owning user's stats in the backing store */
     virtual int sync_user_stats(const DoutPrefixProvider *dpp, optional_yield y) = 0;
     /** Refresh the metadata stats (size, count, and so on) from the backing store */
-    virtual int update_container_stats(const DoutPrefixProvider* dpp) = 0;
+    virtual int update_container_stats(const DoutPrefixProvider* dpp, optional_yield y) = 0;
     /** Check if this bucket needs resharding, and schedule it if it does */
-    virtual int check_bucket_shards(const DoutPrefixProvider* dpp) = 0;
-    /** Change the owner of this bucket in the backing store */
-    virtual int chown(const DoutPrefixProvider* dpp, User* new_user, User* old_user, optional_yield y, const std::string* marker = nullptr) = 0;
+    virtual int check_bucket_shards(const DoutPrefixProvider* dpp, optional_yield y) = 0;
+    /** Change the owner of this bucket in the backing store.  Current owner must be set.  Does not
+     * change ownership of the objects in the bucket. */
+    virtual int chown(const DoutPrefixProvider* dpp, User& new_user, optional_yield y) = 0;
     /** Store the cached bucket info into the backing store */
-    virtual int put_info(const DoutPrefixProvider* dpp, bool exclusive, ceph::real_time mtime) = 0;
+    virtual int put_info(const DoutPrefixProvider* dpp, bool exclusive, ceph::real_time mtime, optional_yield y) = 0;
     /** Check to see if the given user is the owner of this bucket */
     virtual bool is_owner(User* user) = 0;
     /** Get the owner of this bucket */
@@ -699,13 +700,13 @@ class Bucket {
     virtual int merge_and_store_attrs(const DoutPrefixProvider* dpp, Attrs& new_attrs, optional_yield y) = 0;
     /** Try to refresh the cached bucket info from the backing store.  Used in
      * read-modify-update loop. */
-    virtual int try_refresh_info(const DoutPrefixProvider* dpp, ceph::real_time* pmtime) = 0;
+    virtual int try_refresh_info(const DoutPrefixProvider* dpp, ceph::real_time* pmtime, optional_yield y) = 0;
     /** Read usage information about this bucket from the backing store */
     virtual int read_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch, uint32_t max_entries,
 			   bool* is_truncated, RGWUsageIter& usage_iter,
 			   std::map<rgw_user_bucket, rgw_usage_log_entry>& usage) = 0;
     /** Trim the usage information to the given epoch range */
-    virtual int trim_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch) = 0;
+    virtual int trim_usage(const DoutPrefixProvider *dpp, uint64_t start_epoch, uint64_t end_epoch, optional_yield y) = 0;
     /** Remove objects from the bucket index of this bucket.  May be removed from API */
     virtual int remove_objs_from_index(const DoutPrefixProvider *dpp, std::list<rgw_obj_index_key>& objs_to_unlink) = 0;
     /** Check the state of the bucket index, and get stats from it.  May be removed from API */
@@ -715,7 +716,11 @@ class Bucket {
     /** Set a timeout on the check_index() call.  May be removed from API */
     virtual int set_tag_timeout(const DoutPrefixProvider *dpp, uint64_t timeout) = 0;
     /** Remove this specific bucket instance from the backing store.  May be removed from API */
-    virtual int purge_instance(const DoutPrefixProvider* dpp) = 0;
+    virtual int purge_instance(const DoutPrefixProvider* dpp, optional_yield y) = 0;
+    /** Set the cached object count of this bucket */
+    virtual void set_count(uint64_t _count) = 0;
+    /** Set the cached size of this bucket */
+    virtual void set_size(uint64_t _size) = 0;
 
     /** Check if this instantiation is empty */
     virtual bool empty() const = 0;
@@ -768,10 +773,20 @@ class Bucket {
 				const int& max_uploads,
 				std::vector<std::unique_ptr<MultipartUpload>>& uploads,
 				std::map<std::string, bool> *common_prefixes,
-				bool *is_truncated) = 0;
+				bool *is_truncated, optional_yield y) = 0;
     /** Abort multipart uploads in a bucket */
     virtual int abort_multiparts(const DoutPrefixProvider* dpp,
-				 CephContext* cct) = 0;
+				 CephContext* cct, optional_yield y) = 0;
+
+    /** Read the bucket notification config into @a notifications with and (optionally) @a objv_tracker */
+    virtual int read_topics(rgw_pubsub_bucket_topics& notifications, 
+        RGWObjVersionTracker* objv_tracker, optional_yield y, const DoutPrefixProvider *dpp) = 0;
+    /** Write @a notifications with (optionally) @a objv_tracker into the bucket notification config */
+    virtual int write_topics(const rgw_pubsub_bucket_topics& notifications, RGWObjVersionTracker* objv_tracker,
+        optional_yield y, const DoutPrefixProvider *dpp) = 0;
+    /** Remove the bucket notification config with (optionally) @a objv_tracker */
+    virtual int remove_topics(RGWObjVersionTracker* objv_tracker, 
+        optional_yield y, const DoutPrefixProvider *dpp) = 0;
 
     /* dang - This is temporary, until the API is completed */
     virtual rgw_bucket& get_key() = 0;
@@ -883,11 +898,18 @@ class Object {
 
       /** Prepare the Read op.  Must be called first */
       virtual int prepare(optional_yield y, const DoutPrefixProvider* dpp) = 0;
-      /** Synchronous read. Read from @a ofs to @a end into @a bl */
-      virtual int read(int64_t ofs, int64_t end, bufferlist& bl, optional_yield y, const DoutPrefixProvider* dpp) = 0;
-      /** Asynchronous read.  Read from @a ofs to @a end calling @a cb on each read
-       * chunk. */
-      virtual int iterate(const DoutPrefixProvider* dpp, int64_t ofs, int64_t end, RGWGetDataCB* cb, optional_yield y) = 0;
+
+      /** Synchronous read. Read from @a ofs to @a end (inclusive)
+       * into @a bl. Length is `end - ofs + 1`. */
+      virtual int read(int64_t ofs, int64_t end, bufferlist& bl,
+		       optional_yield y, const DoutPrefixProvider* dpp) = 0;
+
+      /** Asynchronous read.  Read from @a ofs to @a end (inclusive)
+       * calling @a cb on each read chunk. Length is `end - ofs +
+       * 1`. */
+      virtual int iterate(const DoutPrefixProvider* dpp, int64_t ofs,
+			  int64_t end, RGWGetDataCB* cb, optional_yield y) = 0;
+
       /** Get an attribute by name */
       virtual int get_attr(const DoutPrefixProvider* dpp, const char* name, bufferlist& dest, optional_yield y) = 0;
     };
@@ -933,9 +955,6 @@ class Object {
     virtual int delete_object(const DoutPrefixProvider* dpp,
 			      optional_yield y,
 			      bool prevent_versioning = false) = 0;
-    /** Asynchronous delete call */
-    virtual int delete_obj_aio(const DoutPrefixProvider* dpp, RGWObjState* astate, Completions* aio,
-			       bool keep_index_consistent, optional_yield y) = 0;
     /** Copy an this object to another object. */
     virtual int copy_object(User* user,
                req_info* info, const rgw_zone_id& source_zone,
@@ -979,6 +998,8 @@ class Object {
 
     /** Get the object state for this object.  Will be removed in the future */
     virtual int get_obj_state(const DoutPrefixProvider* dpp, RGWObjState **state, optional_yield y, bool follow_olh = true) = 0;
+    /** Set the object state for this object */
+    virtual void set_obj_state(RGWObjState& _state) = 0;
     /** Set attributes for this object from the backing store.  Attrs can be set or
      * deleted.  @note the attribute APIs may be revisited in the future. */
     virtual int set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs, Attrs* delattrs, optional_yield y) = 0;
@@ -1013,7 +1034,7 @@ class Object {
 			   optional_yield y) = 0;
     /** Check to see if two placement rules match */
     virtual bool placement_rules_match(rgw_placement_rule& r1, rgw_placement_rule& r2) = 0;
-    /** Dump store-specific object layout info in JSON */
+    /** Dump driver-specific object layout info in JSON */
     virtual int dump_obj_layout(const DoutPrefixProvider *dpp, optional_yield y, Formatter* f) = 0;
 
     /** Get the cached attributes for this object */
@@ -1057,7 +1078,7 @@ class Object {
 
     /** Restore the previous swift version of this object */
     virtual int swift_versioning_restore(bool& restored,   /* out */
-					 const DoutPrefixProvider* dpp) = 0;
+					 const DoutPrefixProvider* dpp, optional_yield y) = 0;
     /** Copy the current version of a swift object to the configured destination bucket*/
     virtual int swift_versioning_copy(const DoutPrefixProvider* dpp,
 				      optional_yield y) = 0;
@@ -1067,13 +1088,10 @@ class Object {
     /** Get a new DeleteOp for this object */
     virtual std::unique_ptr<DeleteOp> get_delete_op() = 0;
 
-    /** Get @a count OMAP values via listing, starting at @a marker for this object */
-    virtual int omap_get_vals(const DoutPrefixProvider *dpp, const std::string& marker, uint64_t count,
-			      std::map<std::string, bufferlist>* m,
-			      bool* pmore, optional_yield y) = 0;
-    /** Get all OMAP key/value pairs for this object */
-    virtual int omap_get_all(const DoutPrefixProvider *dpp, std::map<std::string, bufferlist>* m,
-			     optional_yield y) = 0;
+    /// Return stored torrent info or -ENOENT if there isn't any.
+    virtual int get_torrent_info(const DoutPrefixProvider* dpp,
+                                 optional_yield y, bufferlist& bl) = 0;
+
     /** Get the OMAP values matching the given set of keys */
     virtual int omap_get_vals_by_keys(const DoutPrefixProvider *dpp, const std::string& oid,
 			      const std::set<std::string>& keys,
@@ -1081,6 +1099,8 @@ class Object {
     /** Get a single OMAP value matching the given key */
     virtual int omap_set_val_by_key(const DoutPrefixProvider *dpp, const std::string& key, bufferlist& val,
 				    bool must_exist, optional_yield y) = 0;
+    /** Change the ownership of this object */
+    virtual int chown(User& new_user, const DoutPrefixProvider* dpp, optional_yield y) = 0;
 
     /** Check to see if the given object pointer is uninitialized */
     static bool empty(const Object* o) { return (!o || o->empty()); }
@@ -1178,10 +1198,10 @@ public:
   /** List all the parts of this upload, filling the parts cache */
   virtual int list_parts(const DoutPrefixProvider* dpp, CephContext* cct,
 			 int num_parts, int marker,
-			 int* next_marker, bool* truncated,
+			 int* next_marker, bool* truncated, optional_yield y,
 			 bool assume_unsorted = false) = 0;
   /** Abort this upload */
-  virtual int abort(const DoutPrefixProvider* dpp, CephContext* cct) = 0;
+  virtual int abort(const DoutPrefixProvider* dpp, CephContext* cct, optional_yield y) = 0;
   /** Complete this upload, making it available as a normal object */
   virtual int complete(const DoutPrefixProvider* dpp,
 		       optional_yield y, CephContext* cct,
@@ -1199,7 +1219,7 @@ public:
   /** Get a Writer to write to a part of this upload */
   virtual std::unique_ptr<Writer> get_writer(const DoutPrefixProvider *dpp,
 			  optional_yield y,
-			  std::unique_ptr<rgw::sal::Object> _head_obj,
+			  rgw::sal::Object* obj,
 			  const rgw_user& owner,
 			  const rgw_placement_rule *ptail_placement_rule,
 			  uint64_t part_num,
@@ -1543,14 +1563,14 @@ public:
 } } // namespace rgw::sal
 
 /**
- * @brief A manager for Stores
+ * @brief A manager for Drivers
  *
- * This will manage the singleton instances of the various stores.  Stores come in two
- * varieties: Full and Raw.  A full store is suitable for use in a radosgw daemon.  It
- * has full access to the cluster, if any.  A raw store is a stripped down store, used
+ * This will manage the singleton instances of the various drivers.  Drivers come in two
+ * varieties: Full and Raw.  A full driver is suitable for use in a radosgw daemon.  It
+ * has full access to the cluster, if any.  A raw driver is a stripped down driver, used
  * for admin commands.
  */
-class StoreManager {
+class DriverManager {
 public:
   struct Config {
     /** Name of store to create */
@@ -1559,9 +1579,9 @@ public:
     std::string filter_name;
   };
 
-  StoreManager() {}
-  /** Get a full store by service name */
-  static rgw::sal::Store* get_storage(const DoutPrefixProvider* dpp,
+  DriverManager() {}
+  /** Get a full driver by service name */
+  static rgw::sal::Driver* get_storage(const DoutPrefixProvider* dpp,
 				      CephContext* cct,
 				      const Config& cfg,
 				      bool use_gc_thread,
@@ -1569,24 +1589,26 @@ public:
 				      bool quota_threads,
 				      bool run_sync_thread,
 				      bool run_reshard_thread,
+				      bool run_notification_thread, optional_yield y,
 				      bool use_cache = true,
 				      bool use_gc = true) {
-    rgw::sal::Store* store = init_storage_provider(dpp, cct, cfg, use_gc_thread,
+    rgw::sal::Driver* driver = init_storage_provider(dpp, cct, cfg, use_gc_thread,
 						   use_lc_thread,
 						   quota_threads,
 						   run_sync_thread,
 						   run_reshard_thread,
-						   use_cache, use_gc);
-    return store;
+                                                   run_notification_thread,
+						   use_cache, use_gc, y);
+    return driver;
   }
-  /** Get a stripped down store by service name */
-  static rgw::sal::Store* get_raw_storage(const DoutPrefixProvider* dpp,
+  /** Get a stripped down driver by service name */
+  static rgw::sal::Driver* get_raw_storage(const DoutPrefixProvider* dpp,
 					  CephContext* cct, const Config& cfg) {
-    rgw::sal::Store* store = init_raw_storage_provider(dpp, cct, cfg);
-    return store;
+    rgw::sal::Driver* driver = init_raw_storage_provider(dpp, cct, cfg);
+    return driver;
   }
-  /** Initialize a new full Store */
-  static rgw::sal::Store* init_storage_provider(const DoutPrefixProvider* dpp,
+  /** Initialize a new full Driver */
+  static rgw::sal::Driver* init_storage_provider(const DoutPrefixProvider* dpp,
 						CephContext* cct,
 						const Config& cfg,
 						bool use_gc_thread,
@@ -1594,17 +1616,24 @@ public:
 						bool quota_threads,
 						bool run_sync_thread,
 						bool run_reshard_thread,
+                                                bool run_notification_thread,
 						bool use_metadata_cache,
-						bool use_gc);
-  /** Initialize a new raw Store */
-  static rgw::sal::Store* init_raw_storage_provider(const DoutPrefixProvider* dpp,
+						bool use_gc, optional_yield y);
+  /** Initialize a new raw Driver */
+  static rgw::sal::Driver* init_raw_storage_provider(const DoutPrefixProvider* dpp,
 						    CephContext* cct,
 						    const Config& cfg);
-  /** Close a Store when it's no longer needed */
-  static void close_storage(rgw::sal::Store* store);
+  /** Close a Driver when it's no longer needed */
+  static void close_storage(rgw::sal::Driver* driver);
 
-  /** Get the config for stores/filters */
+  /** Get the config for Drivers */
   static Config get_config(bool admin, CephContext* cct);
+
+  /** Create a ConfigStore */
+  static auto create_config_store(const DoutPrefixProvider* dpp,
+                                  std::string_view type)
+      -> std::unique_ptr<rgw::sal::ConfigStore>;
+
 };
 
 /** @} */

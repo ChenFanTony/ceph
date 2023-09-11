@@ -9,8 +9,6 @@
 #include "common/ceph_time.h"
 #include "common/Formatter.h"
 
-#undef FMT_HEADER_ONLY
-#define FMT_HEADER_ONLY 1
 #include <fmt/format.h>
 
 #include "rgw/rgw_basic_types.h"
@@ -38,6 +36,10 @@ struct rgw_zone_set_entry {
       return false;
     }
     return (location_key < e.location_key);
+  }
+
+  bool operator==(const rgw_zone_set_entry& e) const {
+    return zone == e.zone && location_key == e.location_key;
   }
 
   rgw_zone_set_entry() {}
@@ -70,7 +72,8 @@ struct rgw_zone_set {
     /* no DECODE_START, DECODE_END for backward compatibility */
     ceph::decode(entries, bl);
   }
-
+  void dump(ceph::Formatter *f) const;
+  static void generate_test_instances(std::list<rgw_zone_set*>& o);
   void insert(const std::string& zone, std::optional<std::string> location_key);
   bool exists(const std::string& zone, std::optional<std::string> location_key) const;
 };
@@ -352,83 +355,7 @@ struct rgw_bucket_entry_ver {
 };
 WRITE_CLASS_ENCODER(rgw_bucket_entry_ver)
 
-
-struct cls_rgw_obj_key {
-  std::string name;
-  std::string instance;
-
-  cls_rgw_obj_key() {}
-  cls_rgw_obj_key(const std::string &_name) : name(_name) {}
-  cls_rgw_obj_key(const std::string& n, const std::string& i) : name(n), instance(i) {}
-
-  std::string to_string() const {
-    return fmt::format("{}({})", name, instance);
-  }
-
-  bool empty() const {
-    return name.empty();
-  }
-
-  void set(const std::string& _name) {
-    name = _name;
-    instance.clear();
-  }
-
-  bool operator==(const cls_rgw_obj_key& k) const {
-    return (name.compare(k.name) == 0) &&
-           (instance.compare(k.instance) == 0);
-  }
-
-  bool operator!=(const cls_rgw_obj_key& k) const {
-    return (name.compare(k.name) != 0) ||
-           (instance.compare(k.instance) != 0);
-  }
-
-  bool operator<(const cls_rgw_obj_key& k) const {
-    int r = name.compare(k.name);
-    if (r == 0) {
-      r = instance.compare(k.instance);
-    }
-    return (r < 0);
-  }
-
-  bool operator<=(const cls_rgw_obj_key& k) const {
-    return !(k < *this);
-  }
-
-  void encode(ceph::buffer::list &bl) const {
-    ENCODE_START(1, 1, bl);
-    encode(name, bl);
-    encode(instance, bl);
-    ENCODE_FINISH(bl);
-  }
-  void decode(ceph::buffer::list::const_iterator &bl) {
-    DECODE_START(1, bl);
-    decode(name, bl);
-    decode(instance, bl);
-    DECODE_FINISH(bl);
-  }
-  void dump(ceph::Formatter *f) const {
-    f->dump_string("name", name);
-    f->dump_string("instance", instance);
-  }
-  void decode_json(JSONObj *obj);
-  static void generate_test_instances(std::list<cls_rgw_obj_key*>& ls) {
-    ls.push_back(new cls_rgw_obj_key);
-    ls.push_back(new cls_rgw_obj_key);
-    ls.back()->name = "name";
-    ls.back()->instance = "instance";
-  }
-
-  size_t estimate_encoded_size() const {
-    constexpr size_t start_overhead = sizeof(__u8) + sizeof(__u8) + sizeof(ceph_le32); // version and length prefix
-    constexpr size_t string_overhead = sizeof(__u32); // strings are encoded with 32-bit length prefix
-    return start_overhead +
-        string_overhead + name.size() +
-        string_overhead + instance.size();
-  }
-};
-WRITE_CLASS_ENCODER(cls_rgw_obj_key)
+typedef rgw_obj_index_key cls_rgw_obj_key;
 
 inline std::ostream& operator<<(std::ostream& out, const cls_rgw_obj_key& o) {
   out << o.name;
@@ -786,6 +713,7 @@ enum class cls_rgw_reshard_status : uint8_t {
   IN_PROGRESS     = 1,
   DONE            = 2
 };
+std::ostream& operator<<(std::ostream&, cls_rgw_reshard_status);
 
 inline std::string to_string(const cls_rgw_reshard_status status)
 {
@@ -845,8 +773,14 @@ struct cls_rgw_bucket_instance_entry {
   bool resharding() const {
     return reshard_status != RESHARD_STATUS::NOT_RESHARDING;
   }
+
   bool resharding_in_progress() const {
     return reshard_status == RESHARD_STATUS::IN_PROGRESS;
+  }
+
+  friend std::ostream& operator<<(std::ostream& out, const cls_rgw_bucket_instance_entry& v) {
+    out << "instance entry reshard status: " << v.reshard_status;
+    return out;
   }
 };
 WRITE_CLASS_ENCODER(cls_rgw_bucket_instance_entry)

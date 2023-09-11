@@ -18,8 +18,8 @@ namespace {
 
 namespace crimson::os::seastore::collection_manager {
 
-constexpr static seastore_off_t MIN_FLAT_BLOCK_SIZE = 4<<10;
-[[maybe_unused]] constexpr static seastore_off_t MAX_FLAT_BLOCK_SIZE = 4<<20;
+constexpr static extent_len_t MIN_FLAT_BLOCK_SIZE = 4<<10;
+[[maybe_unused]] constexpr static extent_len_t MAX_FLAT_BLOCK_SIZE = 4<<20;
 
 FlatCollectionManager::FlatCollectionManager(
   TransactionManager &tm)
@@ -80,7 +80,6 @@ FlatCollectionManager::create(coll_root_t &coll_root, Transaction &t,
           coll_root.update(root_extent->get_laddr(), root_extent->get_length());
 
 	  root_extent->decoded = extent->decoded;
-	  root_extent->loaded = true;
 	  return root_extent->create(
 	    get_coll_context(t), cid, info.split_bits
 	  ).si_then([=, this, &t](auto result) {

@@ -323,6 +323,11 @@ public:
    */
   bool scrub_local();
 
+  /**
+   * Go bad due to a damaged dentry (register with damagetable and go BADFRAG)
+   */
+  void go_bad_dentry(snapid_t last, std::string_view dname);
+
   const scrub_info_t *scrub_info() const {
     if (!scrub_infop)
       scrub_info_create();
@@ -399,7 +404,7 @@ public:
 
   bool should_split() const {
     return g_conf()->mds_bal_split_size > 0 &&
-           (int)get_frag_size() > g_conf()->mds_bal_split_size;
+      ((int)get_frag_size() + (int)get_num_snap_items()) > g_conf()->mds_bal_split_size;
   }
   bool should_split_fast() const;
   bool should_merge() const;
@@ -606,8 +611,8 @@ public:
   }
   void enable_frozen_inode();
 
-  std::ostream& print_db_line_prefix(std::ostream& out) override;
-  void print(std::ostream& out) override;
+  std::ostream& print_db_line_prefix(std::ostream& out) const override;
+  void print(std::ostream& out) const override;
   void dump(ceph::Formatter *f, int flags = DUMP_DEFAULT) const;
   void dump_load(ceph::Formatter *f);
 
@@ -660,11 +665,6 @@ protected:
       const std::set<snapid_t> *snaps,
       double rand_threshold,
       bool *force_dirty);
-
-  /**
-   * Go bad due to a damaged dentry (register with damagetable and go BADFRAG)
-   */
-  void go_bad_dentry(snapid_t last, std::string_view dname);
 
   /**
    * Go bad due to a damaged header (register with damagetable and go BADFRAG)
@@ -766,7 +766,6 @@ private:
   void link_inode_work( CDentry *dn, CInode *in );
   void unlink_inode_work( CDentry *dn );
   void remove_null_dentries();
-  void purge_stale_snap_data(const std::set<snapid_t>& snaps);
 
   void prepare_new_fragment(bool replay);
   void prepare_old_fragment(std::map<string_snap_t, MDSContext::vec >& dentry_waiters, bool replay);

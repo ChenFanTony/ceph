@@ -15,6 +15,10 @@ There are important considerations when planning these pools:
 - We recommend the fastest feasible low-latency storage devices (NVMe, Optane,
   or at the very least SAS/SATA SSD) for the metadata pool, as this will
   directly affect the latency of client file system operations.
+- We strongly suggest that the CephFS metadata pool be provisioned on dedicated
+  SSD / NVMe OSDs. This ensures that high client workload does not adversely
+  impact metadata operations. See :ref:`device_classes` to configure pools this
+  way.
 - The data pool used to create the file system is the "default" data pool and
   the location for storing all inode backtrace information, which is used for hard link
   management and disaster recovery. For this reason, all CephFS inodes
@@ -108,7 +112,7 @@ choose which to use when mounting.
 
 If you have created more than one file system, and a client does not
 specify a file system when mounting, you can control which file system
-they will see by using the `ceph fs set-default` command.
+they will see by using the ``ceph fs set-default`` command.
 
 Adding a Data Pool to the File System 
 -------------------------------------

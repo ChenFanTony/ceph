@@ -1,6 +1,10 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
+/* N.B., this header defines fundamental serialized types.  Do not
+ * include files which can only be compiled in radosgw or OSD
+ * contexts (e.g., rgw_sal.h, rgw_common.h) */
+
 #pragma once
 
 #include <string>
@@ -10,10 +14,12 @@ namespace rgw::zone_features {
 
 // zone feature names
 inline constexpr std::string_view resharding = "resharding";
+inline constexpr std::string_view compress_encrypted = "compress-encrypted";
 
 // static list of features supported by this release
 inline constexpr std::initializer_list<std::string_view> supported = {
   resharding,
+  compress_encrypted,
 };
 
 inline constexpr bool supports(std::string_view feature) {
@@ -24,6 +30,11 @@ inline constexpr bool supports(std::string_view feature) {
   }
   return false;
 }
+
+// static list of features enabled by default on new zonegroups
+inline constexpr std::initializer_list<std::string_view> enabled = {
+  resharding,
+};
 
 
 // enable string_view overloads for find() contains() etc

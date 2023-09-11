@@ -18,6 +18,10 @@
 #include <sstream>
 
 #include <netinet/in.h>
+#include "common/fmt_common.h"
+#if FMT_VERSION >= 90000
+#include <fmt/ostream.h>
+#endif
 
 #include "include/ceph_features.h"
 #include "include/types.h"
@@ -541,6 +545,7 @@ struct entity_addr_t {
   }
 
   void dump(ceph::Formatter *f) const;
+  std::string fmt_print() const; ///< used by the default fmt formatter
 
   static void generate_test_instances(std::list<entity_addr_t*>& o);
 };
@@ -735,6 +740,9 @@ struct entity_addrvec_t {
   }
 };
 WRITE_CLASS_ENCODER_FEATURES(entity_addrvec_t);
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<entity_addrvec_t> : fmt::ostream_formatter {};
+#endif
 
 namespace std {
 template<> struct hash<entity_addrvec_t> {

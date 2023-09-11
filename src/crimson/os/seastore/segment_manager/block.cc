@@ -195,7 +195,7 @@ SegmentStateTracker::read_in(
     bptr.length(),
     bptr);
 }
-
+using std::vector;
 static
 block_sm_superblock_t make_superblock(
   device_id_t device_id,
@@ -213,32 +213,37 @@ block_sm_superblock_t make_superblock(
   auto config_segment_size = get_conf<Option::size_t>(
     "seastore_segment_size");
   size_t raw_segments = size / config_segment_size;
-  size_t tracker_size = SegmentStateTracker::get_raw_size(
-    raw_segments,
+  size_t shard_tracker_size = SegmentStateTracker::get_raw_size(
+    raw_segments / seastar::smp::count,
     data.block_size);
-  size_t tracker_off = data.block_size;
-  size_t first_seg_off = tracker_size + tracker_off;
-  size_t segments = (size - first_seg_off) / config_segment_size;
-  size_t available_size = segments * config_segment_size;
+  size_t total_tracker_size = shard_tracker_size * seastar::smp::count;
+  size_t tracker_off = data.block_size;   //superblock
+  size_t segments = (size - tracker_off - total_tracker_size) / config_segment_size;
+  size_t segments_per_shard = segments / seastar::smp::count;
 
-  INFO("{} disk_size={}, available_size={}, segment_size={}, segments={}, "
-       "block_size={}, tracker_off={}, first_seg_off={}",
+  vector<block_shard_info_t> shard_infos(seastar::smp::count);
+  for (unsigned int i = 0; i < seastar::smp::count; i++) {
+    shard_infos[i].size = segments_per_shard * config_segment_size;
+    shard_infos[i].segments = segments_per_shard;
+    shard_infos[i].tracker_offset = tracker_off + i * shard_tracker_size;
+    shard_infos[i].first_segment_offset = tracker_off + total_tracker_size
+                             + i * segments_per_shard * config_segment_size;
+  }
+
+  INFO("{} disk_size={}, segment_size={}, block_size={}",
        device_id_printer_t{device_id},
        size,
-       available_size,
-       config_segment_size,
-       segments,
-       data.block_size,
-       tracker_off,
-       first_seg_off);
+       uint64_t(config_segment_size),
+       data.block_size);
+  for (unsigned int i = 0; i < seastar::smp::count; i++) {
+    INFO("shard {} infos:", i, shard_infos[i]);
+  }
 
   return block_sm_superblock_t{
-    available_size,
+    seastar::smp::count,
     config_segment_size,
     data.block_size,
-    segments,
-    tracker_off,
-    first_seg_off,
+    shard_infos,
     std::move(sm_config)
   };
 }
@@ -310,9 +315,13 @@ open_device_ret open_device(
     return seastar::open_file_dma(
       path,
       seastar::open_flags::rw | seastar::open_flags::dsync
-    ).then([=, &path](auto file) {
-      INFO("path={} successful, size={}", path, stat.size);
-      return std::make_pair(file, stat);
+    ).then([stat, &path, FNAME](auto file) mutable {
+      return file.size().then([stat, file, &path, FNAME](auto size) mutable {
+        stat.size = size;
+        INFO("path={} successful, size={}, block_size={}", 
+        path, stat.size, stat.block_size);
+        return std::make_pair(file, stat);
+      });
     });
   }).handle_exception([FNAME, &path](auto e) -> open_device_ret {
     ERROR("path={} got error -- {}", path, e);
@@ -386,7 +395,7 @@ BlockSegment::BlockSegment(
   BlockSegmentManager &manager, segment_id_t id)
   : manager(manager), id(id) {}
 
-seastore_off_t BlockSegment::get_write_capacity() const
+segment_off_t BlockSegment::get_write_capacity() const
 {
   return manager.get_segment_size();
 }
@@ -397,7 +406,7 @@ Segment::close_ertr::future<> BlockSegment::close()
 }
 
 Segment::write_ertr::future<> BlockSegment::write(
-  seastore_off_t offset, ceph::bufferlist bl)
+  segment_off_t offset, ceph::bufferlist bl)
 {
   LOG_PREFIX(BlockSegment::write);
   auto paddr = paddr_t::make_seg_paddr(id, offset);
@@ -424,12 +433,12 @@ Segment::write_ertr::future<> BlockSegment::write(
 }
 
 Segment::write_ertr::future<> BlockSegment::advance_wp(
-  seastore_off_t offset) {
+  segment_off_t offset) {
   return write_ertr::now();
 }
 
 Segment::close_ertr::future<> BlockSegmentManager::segment_close(
-    segment_id_t id, seastore_off_t write_pointer)
+    segment_id_t id, segment_off_t write_pointer)
 {
   LOG_PREFIX(BlockSegmentManager::segment_close);
   auto s_id = id.device_segment_id();
@@ -445,7 +454,8 @@ Segment::close_ertr::future<> BlockSegmentManager::segment_close(
   stats.closed_segments_unused_bytes += unused_bytes;
   stats.metadata_write.increment(tracker->get_size());
   return tracker->write_out(
-      get_device_id(), device, superblock.tracker_offset);
+      get_device_id(), device,
+      shard_info.tracker_offset);
 }
 
 Segment::write_ertr::future<> BlockSegmentManager::segment_write(
@@ -470,7 +480,18 @@ BlockSegmentManager::~BlockSegmentManager()
 
 BlockSegmentManager::mount_ret BlockSegmentManager::mount()
 {
-  LOG_PREFIX(BlockSegmentManager::mount);
+  return shard_devices.invoke_on_all([](auto &local_device) {
+    return local_device.shard_mount(
+    ).handle_error(
+      crimson::ct_error::assert_all{
+        "Invalid error in BlockSegmentManager::mount"
+    });
+  });
+}
+
+BlockSegmentManager::mount_ret BlockSegmentManager::shard_mount()
+{
+  LOG_PREFIX(BlockSegmentManager::shard_mount);
   return open_device(
     device_path
   ).safe_then([=, this](auto p) {
@@ -479,19 +500,20 @@ BlockSegmentManager::mount_ret BlockSegmentManager::mount()
     return read_superblock(device, sd);
   }).safe_then([=, this](auto sb) {
     set_device_id(sb.config.spec.id);
-    INFO("{} read {}", device_id_printer_t{get_device_id()}, sb);
+    shard_info = sb.shard_infos[seastar::this_shard_id()];
+    INFO("{} read {}", device_id_printer_t{get_device_id()}, shard_info);
     sb.validate();
     superblock = sb;
     stats.data_read.increment(
         ceph::encoded_sizeof<block_sm_superblock_t>(superblock));
     tracker = std::make_unique<SegmentStateTracker>(
-      superblock.segments,
+      shard_info.segments,
       superblock.block_size);
     stats.data_read.increment(tracker->get_size());
     return tracker->read_in(
       get_device_id(),
       device,
-      superblock.tracker_offset
+      shard_info.tracker_offset
     ).safe_then([this] {
       for (device_segment_id_t i = 0; i < tracker->get_capacity(); ++i) {
 	if (tracker->get(i) == segment_state_t::OPEN) {
@@ -500,7 +522,8 @@ BlockSegmentManager::mount_ret BlockSegmentManager::mount()
       }
       stats.metadata_write.increment(tracker->get_size());
       return tracker->write_out(
-          get_device_id(), device, superblock.tracker_offset);
+          get_device_id(), device,
+          shard_info.tracker_offset);
     });
   }).safe_then([this, FNAME] {
     INFO("{} complete", device_id_printer_t{get_device_id()});
@@ -511,7 +534,23 @@ BlockSegmentManager::mount_ret BlockSegmentManager::mount()
 BlockSegmentManager::mkfs_ret BlockSegmentManager::mkfs(
   device_config_t sm_config)
 {
-  LOG_PREFIX(BlockSegmentManager::mkfs);
+  return shard_devices.local().primary_mkfs(sm_config
+  ).safe_then([this] {
+    return shard_devices.invoke_on_all([](auto &local_device) {
+      return local_device.shard_mkfs(
+      ).handle_error(
+        crimson::ct_error::assert_all{
+          "Invalid error in BlockSegmentManager::mkfs"
+      });
+    });
+  });
+}
+
+BlockSegmentManager::mkfs_ret BlockSegmentManager::primary_mkfs(
+  device_config_t sm_config)
+{
+  LOG_PREFIX(BlockSegmentManager::primary_mkfs);
+  ceph_assert(sm_config.spec.dtype == superblock.config.spec.dtype);
   set_device_id(sm_config.spec.id);
   INFO("{} path={}, {}",
        device_id_printer_t{get_device_id()}, device_path, sm_config);
@@ -538,18 +577,40 @@ BlockSegmentManager::mkfs_ret BlockSegmentManager::mkfs(
       stats.metadata_write.increment(
           ceph::encoded_sizeof<block_sm_superblock_t>(sb));
       return write_superblock(get_device_id(), device, sb);
-    }).safe_then([&, FNAME, this] {
-      DEBUG("{} superblock written", device_id_printer_t{get_device_id()});
-      tracker.reset(new SegmentStateTracker(sb.segments, sb.block_size));
-      stats.metadata_write.increment(tracker->get_size());
-      return tracker->write_out(
-          get_device_id(), device, sb.tracker_offset);
     }).finally([&] {
       return device.close();
     }).safe_then([FNAME, this] {
       INFO("{} complete", device_id_printer_t{get_device_id()});
       return mkfs_ertr::now();
     });
+  });
+}
+
+BlockSegmentManager::mkfs_ret BlockSegmentManager::shard_mkfs()
+{
+  LOG_PREFIX(BlockSegmentManager::shard_mkfs);
+  return open_device(
+    device_path
+  ).safe_then([this](auto p) {
+    device = std::move(p.first);
+    auto sd = p.second;
+    return read_superblock(device, sd);
+  }).safe_then([this, FNAME](auto sb) {
+    set_device_id(sb.config.spec.id);
+    shard_info = sb.shard_infos[seastar::this_shard_id()];
+    INFO("{} read {}", device_id_printer_t{get_device_id()}, shard_info);
+    sb.validate();
+    tracker.reset(new SegmentStateTracker(
+      shard_info.segments, sb.block_size));
+    stats.metadata_write.increment(tracker->get_size());
+    return tracker->write_out(
+      get_device_id(), device,
+      shard_info.tracker_offset);
+  }).finally([this] {
+    return device.close();
+  }).safe_then([FNAME, this] {
+    INFO("{} complete", device_id_printer_t{get_device_id()});
+    return mkfs_ertr::now();
   });
 }
 
@@ -583,7 +644,8 @@ SegmentManager::open_ertr::future<SegmentRef> BlockSegmentManager::open(
   tracker->set(s_id, segment_state_t::OPEN);
   stats.metadata_write.increment(tracker->get_size());
   return tracker->write_out(
-      get_device_id(), device, superblock.tracker_offset
+      get_device_id(), device,
+      shard_info.tracker_offset
   ).safe_then([this, id, FNAME] {
     ++stats.opened_segments;
     DEBUG("{} done", id);
@@ -616,7 +678,8 @@ SegmentManager::release_ertr::future<> BlockSegmentManager::release(
   ++stats.released_segments;
   stats.metadata_write.increment(tracker->get_size());
   return tracker->write_out(
-      get_device_id(), device, superblock.tracker_offset);
+      get_device_id(), device,
+      shard_info.tracker_offset);
 }
 
 SegmentManager::read_ertr::future<> BlockSegmentManager::read(

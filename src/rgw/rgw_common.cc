@@ -168,6 +168,8 @@ rgw_http_errors rgw_http_iam_errors({
 using namespace std;
 using namespace ceph::crypto;
 
+thread_local bool is_asio_thread = false;
+
 rgw_err::
 rgw_err()
 {
@@ -267,8 +269,9 @@ void req_info::rebuild_from(req_info& src)
 }
 
 
-req_state::req_state(CephContext* _cct, RGWEnv* e, uint64_t id)
-  : cct(_cct), info(_cct, e), id(id)
+req_state::req_state(CephContext* _cct, const RGWProcessEnv& penv,
+                     RGWEnv* e, uint64_t id)
+  : cct(_cct), penv(penv), info(_cct, e), id(id)
 {
   enable_ops_log = e->get_enable_ops_log();
   enable_usage_log = e->get_enable_usage_log();
@@ -365,8 +368,7 @@ void dump(req_state* s)
     s->formatter->open_object_section("Error");
   if (!s->err.err_code.empty())
     s->formatter->dump_string("Code", s->err.err_code);
-  if (!s->err.message.empty())
-    s->formatter->dump_string("Message", s->err.message);
+  s->formatter->dump_string("Message", s->err.message);
   if (!s->bucket_name.empty())	// TODO: connect to expose_bucket
     s->formatter->dump_string("BucketName", s->bucket_name);
   if (!s->trans_id.empty())	// TODO: connect to expose_bucket or another toggle
@@ -1141,7 +1143,8 @@ bool verify_user_permission(const DoutPrefixProvider* dpp,
                             const vector<rgw::IAM::Policy>& user_policies,
                             const vector<rgw::IAM::Policy>& session_policies,
                             const rgw::ARN& res,
-                            const uint64_t op)
+                            const uint64_t op,
+                            bool mandatory_policy)
 {
   auto identity_policy_res = eval_identity_or_session_policies(dpp, user_policies, s->env, op, res);
   if (identity_policy_res == Effect::Deny) {
@@ -1164,13 +1167,15 @@ bool verify_user_permission(const DoutPrefixProvider* dpp,
     return true;
   }
 
-  if (op == rgw::IAM::s3CreateBucket || op == rgw::IAM::s3ListAllMyBuckets) {
-    auto perm = op_to_perm(op);
-
-    return verify_user_permission_no_policy(dpp, s, user_acl, perm);
+  if (mandatory_policy) {
+    // no policies, and policy is mandatory
+    ldpp_dout(dpp, 20) << "no policies for a policy mandatory op " << op << dendl;
+    return false;
   }
 
-  return false;
+  auto perm = op_to_perm(op);
+
+  return verify_user_permission_no_policy(dpp, s, user_acl, perm);
 }
 
 bool verify_user_permission_no_policy(const DoutPrefixProvider* dpp,
@@ -1194,10 +1199,11 @@ bool verify_user_permission_no_policy(const DoutPrefixProvider* dpp,
 bool verify_user_permission(const DoutPrefixProvider* dpp,
                             req_state * const s,
                             const rgw::ARN& res,
-                            const uint64_t op)
+                            const uint64_t op,
+                            bool mandatory_policy)
 {
   perm_state_from_req_state ps(s);
-  return verify_user_permission(dpp, &ps, s->user_acl.get(), s->iam_user_policies, s->session_policies, res, op);
+  return verify_user_permission(dpp, &ps, s->user_acl.get(), s->iam_user_policies, s->session_policies, res, op, mandatory_policy);
 }
 
 bool verify_user_permission_no_policy(const DoutPrefixProvider* dpp, 
@@ -2017,6 +2023,15 @@ void RGWUserCaps::dump(Formatter *f) const
   dump(f, "caps");
 }
 
+void RGWUserCaps::generate_test_instances(list<RGWUserCaps*>& o)
+{
+  o.push_back(new RGWUserCaps);
+  RGWUserCaps *caps = new RGWUserCaps;
+  caps->add_cap("read");
+  caps->add_cap("write");
+  o.push_back(caps);
+}
+
 void RGWUserCaps::dump(Formatter *f, const char *name) const
 {
   f->open_array_section(name);
@@ -2142,6 +2157,16 @@ void rgw_raw_obj::decode_from_rgw_obj(bufferlist::const_iterator& bl)
 
   get_obj_bucket_and_oid_loc(old_obj, oid, loc);
   pool = old_obj.get_explicit_data_pool();
+}
+
+void rgw_raw_obj::generate_test_instances(std::list<rgw_raw_obj*>& o)
+{
+  rgw_raw_obj *r = new rgw_raw_obj;
+  r->oid = "foo";
+  r->loc = "bar";
+  r->pool.name = "baz";
+  r->pool.ns = "ns";
+  o.push_back(r);
 }
 
 static struct rgw_name_to_flag op_type_mapping[] = { {"*",  RGW_OP_TYPE_ALL},
@@ -3057,3 +3082,13 @@ rgw_global_init(const std::map<std::string,std::string> *defaults,
   // Finish global init, indicating we already ran pre-init
   return global_init(defaults, args, module_type, code_env, flags, false);
 }
+
+void RGWObjVersionTracker::generate_new_write_ver(CephContext *cct)
+{
+  write_version.ver = 1;
+#define TAG_LEN 24
+
+  write_version.tag.clear();
+  append_rand_alpha(cct, write_version.tag, write_version.tag, TAG_LEN);
+}
+
