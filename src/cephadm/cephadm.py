@@ -6,7 +6,6 @@ import ipaddress
 import io
 import json
 import logging
-from logging.config import dictConfig
 import os
 import platform
 import pwd
@@ -80,7 +79,6 @@ from cephadmlib.constants import (
     LOG_DIR_MODE,
     NO_DEPRECATED,
     PIDS_LIMIT_UNLIMITED_PODMAN_VERSION,
-    QUIET_LOG_LEVEL,
     SYSCTL_DIR,
     UNIT_DIR,
 )
@@ -139,11 +137,12 @@ from cephadmlib.net_utils import (
 from cephadmlib.locking import FileLock
 from cephadmlib.daemon_identity import DaemonIdentity
 from cephadmlib.packagers import create_packager, Packager
+from cephadmlib.logging import cephadm_init_logging
 
 FuncT = TypeVar('FuncT', bound=Callable)
 
 
-logger: logging.Logger = None  # type: ignore
+logger = logging.getLogger()
 
 """
 You can invoke cephadm in two ways:
@@ -202,88 +201,6 @@ class DeploymentType(Enum):
     # Reconfiguring a daemon. Rewrites config
     # files and potentially restarts daemon.
     RECONFIG = 'Reconfig'
-
-
-# During normal cephadm operations (cephadm ls, gather-facts, etc ) we use:
-# stdout: for JSON output only
-# stderr: for error, debug, info, etc
-logging_config = {
-    'version': 1,
-    'disable_existing_loggers': True,
-    'formatters': {
-        'cephadm': {
-            'format': '%(asctime)s %(thread)x %(levelname)s %(message)s'
-        },
-    },
-    'handlers': {
-        'console': {
-            'level': 'INFO',
-            'class': 'logging.StreamHandler',
-        },
-        'log_file': {
-            'level': 'DEBUG',
-            'class': 'logging.handlers.WatchedFileHandler',
-            'formatter': 'cephadm',
-            'filename': '%s/cephadm.log' % LOG_DIR,
-        }
-    },
-    'loggers': {
-        '': {
-            'level': 'DEBUG',
-            'handlers': ['console', 'log_file'],
-        }
-    }
-}
-
-
-class ExcludeErrorsFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        """Only lets through log messages with log level below WARNING ."""
-        return record.levelno < logging.WARNING
-
-
-# When cephadm is used as standard binary (bootstrap, rm-cluster, etc) we use:
-# stdout: for debug and info
-# stderr: for errors and warnings
-interactive_logging_config = {
-    'version': 1,
-    'filters': {
-        'exclude_errors': {
-            '()': ExcludeErrorsFilter
-        }
-    },
-    'disable_existing_loggers': True,
-    'formatters': {
-        'cephadm': {
-            'format': '%(asctime)s %(thread)x %(levelname)s %(message)s'
-        },
-    },
-    'handlers': {
-        'console_stdout': {
-            'level': 'INFO',
-            'class': 'logging.StreamHandler',
-            'filters': ['exclude_errors'],
-            'stream': sys.stdout
-        },
-        'console_stderr': {
-            'level': 'WARNING',
-            'class': 'logging.StreamHandler',
-            'stream': sys.stderr
-        },
-        'log_file': {
-            'level': 'DEBUG',
-            'class': 'logging.handlers.WatchedFileHandler',
-            'formatter': 'cephadm',
-            'filename': '%s/cephadm.log' % LOG_DIR,
-        }
-    },
-    'loggers': {
-        '': {
-            'level': 'DEBUG',
-            'handlers': ['console_stdout', 'console_stderr', 'log_file'],
-        }
-    }
-}
 
 
 class termcolor:
@@ -752,6 +669,7 @@ class CephIscsi(object):
         mounts[os.path.join(data_dir, 'keyring')] = '/etc/ceph/keyring:z'
         mounts[os.path.join(data_dir, 'iscsi-gateway.cfg')] = '/etc/ceph/iscsi-gateway.cfg:z'
         mounts[os.path.join(data_dir, 'configfs')] = '/sys/kernel/config'
+        mounts[os.path.join(data_dir, 'tcmu-runner-entrypoint.sh')] = '/usr/local/scripts/tcmu-runner-entrypoint.sh'
         mounts[log_dir] = '/var/log:z'
         mounts['/dev'] = '/dev'
         return mounts
@@ -816,8 +734,18 @@ class CephIscsi(object):
         configfs_dir = os.path.join(data_dir, 'configfs')
         makedirs(configfs_dir, uid, gid, 0o755)
 
+        # set up the tcmu-runner entrypoint script
+        # to be mounted into the container. For more info
+        # on why we need this script, see the
+        # tcmu_runner_entrypoint_script function
+        self.files['tcmu-runner-entrypoint.sh'] = self.tcmu_runner_entrypoint_script()
+
         # populate files from the config-json
         populate_files(data_dir, self.files, uid, gid)
+
+        # we want the tcmu runner entrypoint script to be executable
+        # populate_files will give it 0o600 by default
+        os.chmod(os.path.join(data_dir, 'tcmu-runner-entrypoint.sh'), 0o700)
 
     @staticmethod
     def configfs_mount_umount(data_dir, mount=True):
@@ -831,13 +759,53 @@ class CephIscsi(object):
                   'umount {0}; fi'.format(mount_path)
         return cmd.split()
 
+    @staticmethod
+    def tcmu_runner_entrypoint_script() -> str:
+        # since we are having tcmu-runner be a background
+        # process in its systemd unit (rbd-target-api being
+        # the main process) systemd will not restart it when
+        # it fails. in order to try and get around that for now
+        # we can have a script mounted in the container that
+        # that attempts to do the restarting for us. This script
+        # can then become the entrypoint for the tcmu-runner
+        # container
+
+        # This is intended to be dropped for a better solution
+        # for at least the squid release onward
+        return """#!/bin/bash
+RUN_DIR=/var/run/tcmu-runner
+
+if [ ! -d "${RUN_DIR}" ] ; then
+    mkdir -p "${RUN_DIR}"
+fi
+
+rm -rf "${RUN_DIR}"/*
+
+while true
+do
+    touch "${RUN_DIR}"/start-up-$(date -Ins)
+    /usr/bin/tcmu-runner
+
+    # If we got around 3 kills/segfaults in the last minute,
+    # don't start anymore
+    if [ $(find "${RUN_DIR}" -type f -cmin -1 | wc -l) -ge 3 ] ; then
+        exit 0
+    fi
+
+    sleep 1
+done
+"""
+
     def get_tcmu_runner_container(self):
         # type: () -> CephContainer
         # daemon_id, is used to generated the cid and pid files used by podman but as both tcmu-runner
         # and rbd-target-api have the same daemon_id, it conflits and prevent the second container from
         # starting. .tcmu runner is appended to the daemon_id to fix that.
         tcmu_container = get_deployment_container(self.ctx, self.fsid, self.daemon_type, str(self.daemon_id) + '.tcmu')
-        tcmu_container.entrypoint = '/usr/bin/tcmu-runner'
+        # TODO: Eventually we don't want to run tcmu-runner through this script.
+        # This is intended to be a workaround backported to older releases
+        # and should eventually be removed in at least squid onward
+        tcmu_container.entrypoint = '/usr/local/scripts/tcmu-runner-entrypoint.sh'
         tcmu_container.cname = self.get_container_name(desc='tcmu')
         return tcmu_container
 
@@ -2281,6 +2249,15 @@ def _write_custom_conf_files(ctx: CephadmContext, daemon_type: str, daemon_id: s
             file_path = os.path.join(custom_config_dir, os.path.basename(ccf['mount_path']))
             with write_new(file_path, owner=(uid, gid), encoding='utf-8') as f:
                 f.write(ccf['content'])
+            # temporary workaround to make custom config files work for tcmu-runner
+            # container we deploy with iscsi until iscsi is refactored
+            if daemon_type == 'iscsi':
+                tcmu_config_dir = custom_config_dir + '.tcmu'
+                if not os.path.exists(tcmu_config_dir):
+                    makedirs(tcmu_config_dir, uid, gid, 0o755)
+                tcmu_file_path = os.path.join(tcmu_config_dir, os.path.basename(ccf['mount_path']))
+                with write_new(tcmu_file_path, owner=(uid, gid), encoding='utf-8') as f:
+                    f.write(ccf['content'])
 
 
 def get_parm(option: str) -> Dict[str, str]:
@@ -9284,43 +9261,6 @@ def cephadm_init_ctx(args: List[str]) -> CephadmContext:
     return ctx
 
 
-def cephadm_init_logging(ctx: CephadmContext, args: List[str]) -> None:
-    """Configure the logging for cephadm as well as updating the system
-    to have the expected log dir and logrotate configuration.
-    """
-    logging.addLevelName(QUIET_LOG_LEVEL, 'QUIET')
-    global logger
-    if not os.path.exists(LOG_DIR):
-        os.makedirs(LOG_DIR)
-    operations = ['bootstrap', 'rm-cluster']
-    if any(op in args for op in operations):
-        dictConfig(interactive_logging_config)
-    else:
-        dictConfig(logging_config)
-
-    logger = logging.getLogger()
-    logger.setLevel(QUIET_LOG_LEVEL)
-
-    if not os.path.exists(ctx.logrotate_dir + '/cephadm'):
-        with open(ctx.logrotate_dir + '/cephadm', 'w') as f:
-            f.write("""# created by cephadm
-/var/log/ceph/cephadm.log {
-    rotate 7
-    daily
-    compress
-    missingok
-    notifempty
-    su root root
-}
-""")
-
-    if ctx.verbose:
-        for handler in logger.handlers:
-            if handler.name in ['console', 'log_file', 'console_stdout']:
-                handler.setLevel(QUIET_LOG_LEVEL)
-    logger.debug('%s\ncephadm %s' % ('-' * 80, args))
-
-
 def cephadm_require_root() -> None:
     """Exit if the process is not running as root."""
     if os.geteuid() != 0:
@@ -9347,7 +9287,7 @@ def main() -> None:
             sys.exit(1)
 
     cephadm_require_root()
-    cephadm_init_logging(ctx, av)
+    cephadm_init_logging(ctx, logger, av)
     try:
         # podman or docker?
         ctx.container_engine = find_container_engine(ctx)

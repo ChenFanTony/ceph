@@ -134,61 +134,71 @@ Decentralized Placement of Replicated Data`_.
 Cluster Map
 ~~~~~~~~~~~
 
-Ceph depends upon Ceph Clients and Ceph OSD Daemons having knowledge of the
-cluster topology, which is inclusive of 5 maps collectively referred to as the
-"Cluster Map":
+In order for a Ceph cluster to function properly, Ceph Clients and Ceph OSDs
+must have current information about the cluster's topology. Current information
+is stored in the "Cluster Map", which is in fact a collection of five maps. The
+five maps that constitute the cluster map are:
 
-#. **The Monitor Map:** Contains the cluster ``fsid``, the position, name 
-   address and port of each monitor. It also indicates the current epoch, 
-   when the map was created, and the last time it changed. To view a monitor
-   map, execute ``ceph mon dump``.   
+#. **The Monitor Map:** Contains the cluster ``fsid``, the position, the name,
+   the address, and the TCP port of each monitor. The monitor map specifies the
+   current epoch, the time of the monitor map's creation, and the time of the
+   monitor map's last modification.  To view a monitor map, run ``ceph mon
+   dump``.   
    
-#. **The OSD Map:** Contains the cluster ``fsid``, when the map was created and
-   last modified, a list of pools, replica sizes, PG numbers, a list of OSDs
-   and their status (e.g., ``up``, ``in``). To view an OSD map, execute
-   ``ceph osd dump``. 
+#. **The OSD Map:** Contains the cluster ``fsid``, the time of the OSD map's
+   creation, the time of the OSD map's last modification, a list of pools, a
+   list of replica sizes, a list of PG numbers, and a list of OSDs and their
+   statuses (for example, ``up``, ``in``). To view an OSD map, run ``ceph
+   osd dump``. 
    
-#. **The PG Map:** Contains the PG version, its time stamp, the last OSD
-   map epoch, the full ratios, and details on each placement group such as
-   the PG ID, the `Up Set`, the `Acting Set`, the state of the PG (e.g., 
-   ``active + clean``), and data usage statistics for each pool.
+#. **The PG Map:** Contains the PG version, its time stamp, the last OSD map
+   epoch, the full ratios, and the details of each placement group. This
+   includes the PG ID, the `Up Set`, the `Acting Set`, the state of the PG (for
+   example, ``active + clean``), and data usage statistics for each pool.
 
 #. **The CRUSH Map:** Contains a list of storage devices, the failure domain
-   hierarchy (e.g., device, host, rack, row, room, etc.), and rules for 
-   traversing the hierarchy when storing data. To view a CRUSH map, execute
-   ``ceph osd getcrushmap -o {filename}``; then, decompile it by executing
-   ``crushtool -d {comp-crushmap-filename} -o {decomp-crushmap-filename}``.
-   You can view the decompiled map in a text editor or with ``cat``. 
+   hierarchy (for example, ``device``, ``host``, ``rack``, ``row``, ``room``),
+   and rules for traversing the hierarchy when storing data. To view a CRUSH
+   map, run ``ceph osd getcrushmap -o {filename}`` and then decompile it by
+   running ``crushtool -d {comp-crushmap-filename} -o
+   {decomp-crushmap-filename}``. Use a text editor or ``cat`` to view the
+   decompiled map.
 
 #. **The MDS Map:** Contains the current MDS map epoch, when the map was 
    created, and the last time it changed. It also contains the pool for 
    storing metadata, a list of metadata servers, and which metadata servers
    are ``up`` and ``in``. To view an MDS map, execute ``ceph fs dump``.
 
-Each map maintains an iterative history of its operating state changes. Ceph
-Monitors maintain a master copy of the cluster map including the cluster
-members, state, changes, and the overall health of the Ceph Storage Cluster.
+Each map maintains a history of changes to its operating state. Ceph Monitors
+maintain a master copy of the cluster map. This master copy includes the
+cluster members, the state of the cluster, changes to the cluster, and
+information recording the overall health of the Ceph Storage Cluster.
 
 .. index:: high availability; monitor architecture
 
 High Availability Monitors
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Before Ceph Clients can read or write data, they must contact a Ceph Monitor
-to obtain the most recent copy of the cluster map. A Ceph Storage Cluster
-can operate with a single monitor; however, this introduces a single 
-point of failure (i.e., if the monitor goes down, Ceph Clients cannot
-read or write data).
+A Ceph Client must contact a Ceph Monitor and obtain a current copy of the
+cluster map in order to read data from or to write data to the Ceph cluster.
 
-For added reliability and fault tolerance, Ceph supports a cluster of monitors.
-In a cluster of monitors, latency and other faults can cause one or more
-monitors to fall behind the current state of the cluster. For this reason, Ceph
-must have agreement among various monitor instances regarding the state of the
-cluster. Ceph always uses a majority of monitors (e.g., 1, 2:3, 3:5, 4:6, etc.)
-and the `Paxos`_ algorithm to establish a consensus among the monitors about the
-current state of the cluster.
+It is possible for a Ceph cluster to function properly with only a single
+monitor, but a Ceph cluster that has only a single monitor has a single point
+of failure: if the monitor goes down, Ceph clients will be unable to read data
+from or write data to the cluster.
 
-For details on configuring monitors, see the `Monitor Config Reference`_.
+Ceph leverages a cluster of monitors in order to increase reliability and fault
+tolerance. When a cluster of monitors is used, however, one or more of the
+monitors in the cluster can fall behind due to latency or other faults. Ceph
+mitigates these negative effects by requiring multiple monitor instances to
+agree about the state of the cluster. To establish consensus among the monitors
+regarding the state of the cluster, Ceph uses the `Paxos`_ algorithm and a
+majority of monitors (for example, one in a cluster that contains only one
+monitor, two in a cluster that contains three monitors, three in a cluster that
+contains five monitors, four in a cluster that contains six monitors, and so
+on).
+
+See the `Monitor Config Reference`_ for more detail on configuring monitors.
 
 .. index:: architecture; high availability authentication
 
@@ -1458,6 +1468,8 @@ files on a storage drive.
 
 
 .. index:: architecture; Ceph Clients
+
+.. _architecture_ceph_clients:
 
 Ceph Clients
 ============
